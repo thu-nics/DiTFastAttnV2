@@ -27,6 +27,7 @@ outputs/
 out/
 temp/
 tmp/
+tmp*
 .vscode/
 checkpoints/
 dev/

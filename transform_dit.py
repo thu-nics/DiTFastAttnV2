@@ -66,6 +66,7 @@ def transformer_forward_pre_hook(m: Transformer2DModel, args, kwargs):
         # compression strategies to override the saved residual.
         block.attn1.processor.need_compute_residual[now_stepi] = False
         block.attn1.processor.need_cache_output = False
+        block.ff.need_cache_output = False
     raw_outs = m.forward(*args, **kwargs)
     for blocki, block in enumerate(m.transformer_blocks):
         if now_stepi == 0:
@@ -90,7 +91,7 @@ def transformer_forward_pre_hook(m: Transformer2DModel, args, kwargs):
                 outs = m.forward(*args, **kwargs)
 
                 l = compression_loss(raw_outs, outs, metric=m.metric)
-                threshold = m.loss_thresholds[now_stepi][blocki]
+                threshold = m.loss_thresholds[now_stepi][blocki][0]
 
                 if m.debug:
                     print(f"{method}: L(O,O')={l} threshold={threshold}")
@@ -120,11 +121,11 @@ def transformer_forward_pre_hook(m: Transformer2DModel, args, kwargs):
                 outs = m.forward(*args, **kwargs)
 
                 l = compression_loss(raw_outs, outs, metric=m.metric)
-                threshold = m.loss_thresholds[now_stepi][blocki]
+                threshold_ff = m.loss_thresholds[now_stepi][blocki][1]
 
                 if m.debug:
-                    print(f"{method}: L(O,O')={l} threshold={threshold}")
-                if l < threshold:
+                    print(f"{method}: L(O,O')={l} threshold_ff={threshold_ff}")
+                if l < threshold_ff:
                     selected_method = method
                     break
 
@@ -146,6 +147,7 @@ def transformer_forward_pre_hook(m: Transformer2DModel, args, kwargs):
         # The residual will be saved in the follow-up forward call.
         block.attn1.processor.need_compute_residual[now_stepi] = True
         block.attn1.processor.need_cache_output = True
+        block.ff.need_cache_output = True
 
 
 @torch.no_grad()
@@ -222,12 +224,14 @@ def transform_model_fast_attention(
                 block.ff = FastFeedForward(block.ff, ["full_attn" for _ in range(n_steps)], cond_first=cond_first)
 
         # Setup loss threshold for each timestep and layer
+        FF_THRESHOLD_OFFSET = 0.5
         loss_thresholds = []
         for step_i in range(n_steps):
             sub_list = []
             for blocki in range(len(blocks)):
                 threshold_i = (blocki + 1) / len(blocks) * threshold
-                sub_list.append(threshold_i)
+                threshold_i_ff = threshold_i + FF_THRESHOLD_OFFSET / len(blocks) * threshold
+                sub_list.append([threshold_i, threshold_i_ff])
             loss_thresholds.append(sub_list)
 
         # calibration
