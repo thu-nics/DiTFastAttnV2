@@ -1,9 +1,10 @@
 import torch.nn as nn
 import torch
+import copy
 
 
-class FastFeedForward(nn.Module):
-    def __init__(self, raw_module, steps_method, cond_first):
+class DiTFastAttnFFN(nn.Module):
+    def __init__(self, raw_module, steps_method=None, cond_first=None):
         super().__init__()
         self.raw_module = raw_module
         self.steps_method = steps_method
@@ -12,6 +13,10 @@ class FastFeedForward(nn.Module):
 
         self.cond_first = cond_first
         self.need_cache_output = True
+
+    def update_config(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, copy.deepcopy(value))
 
     def forward(self, hidden_states):
         method = self.steps_method[self.stepi]

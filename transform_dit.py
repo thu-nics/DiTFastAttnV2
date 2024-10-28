@@ -167,6 +167,7 @@ def transform_model_fast_attention(
     metric="",
     negative_prompt="",
     guidance_scale=4,
+    is_transform_ff=False,
 ):
     pipe = set_stepi_warp(raw_pipe)
     blocks = pipe.transformer.transformer_blocks
@@ -175,11 +176,10 @@ def transform_model_fast_attention(
     is_transform_attn2 = False
     print(f"Transform attn2 {is_transform_attn2}")
     # is_transform_ff=hasattr(blocks[0],"ff")
-    is_transform_ff = True
     print(f"Transform ff {is_transform_ff}")
 
     st = time()
-    cache_file = f"cache/{raw_pipe.config._name_or_path.replace('/','_')}_{n_steps}_{n_calib}_{threshold}_{sequential_calib}_{window_size}_{guidance_scale}"
+    cache_file = f"cache/{raw_pipe.config._name_or_path.replace('/','_')}_{n_steps}_{n_calib}_{threshold}_{sequential_calib}_{window_size}_{guidance_scale}_ff{is_transform_ff}"
     if ablation != "":
         cache_file = cache_file + f"_{ablation}"
     if metric != "":

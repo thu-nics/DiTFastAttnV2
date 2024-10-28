@@ -3,40 +3,49 @@ from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from typing import Optional
 import torch.nn.functional as F
 import flash_attn
+import copy
 
 # from natten.functional import na1d, na2d
 import torch.nn as nn
 import math
 
 
-class FastAttnProcessor:
-    def __init__(self, window_size, steps_method, cond_first):
-        self.window_size = window_size
+class DiTFastAttnProcessor:
+    def __init__(self, steps_method=None, cond_first=None):
         self.steps_method = steps_method
         # CFG order flag (conditional first or unconditional first)
         self.cond_first = cond_first
         # Check at which timesteps do we need to compute the full-window residual
         # of this attention module
-        self.need_compute_residual = self.compute_need_compute_residual(steps_method)
+        self.raw_steps_residual_config = self.compute_raw_steps_residual_config(steps_method)
         self.need_cache_output = True
         self.mask_cache = {}
+        self.stepi = 0
 
-    def compute_need_compute_residual(self, steps_method):
-        need_compute_residual = []
+    def update_config(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, copy.deepcopy(value))
+        self.raw_steps_residual_config = self.compute_raw_steps_residual_config(self.steps_method)
+
+    def compute_raw_steps_residual_config(self, steps_method):
+        steps_residual_config = []
+        assert steps_method[0] == "raw", "The first step of DiTFastAttnProcessor must be raw"
         for i, method in enumerate(steps_method):
-            need = False
-            if "full_attn" in method:
+            residual_config = (False, None)
+            if "raw" in method:
                 for j in range(i + 1, len(steps_method)):
                     if "residual_window_attn" in steps_method[j] and "without_residual" not in steps_method[j]:
                         # If encountered a step that conduct WA-RS,
                         # this step needs the residual computation
-                        need = True
-                    if "full_attn" in steps_method[j]:
+                        window_size = int(steps_method[j].split("_")[-1])
+                        residual_config = (True, (window_size // 2, window_size // 2))
+                        break
+                    if "raw" in steps_method[j]:
                         # If encountered another step using the `full-attn` strategy,
                         # this step doesn't need the residual computation
                         break
-            need_compute_residual.append(need)
-        return need_compute_residual
+            steps_residual_config.append(residual_config)
+        return steps_residual_config
 
     def run_forward_method(self, m, hidden_states, encoder_hidden_states, attention_mask, temb, method):
         residual = hidden_states
@@ -115,11 +124,12 @@ class FastAttnProcessor:
                     dropout_p=0.0,
                     is_causal=False,
                 ).transpose(1, 2)
-            elif "full_attn" in method:
+            elif "raw" in method:
                 all_hidden_states = flash_attn.flash_attn_func(query, key, value)
-                if self.need_compute_residual[m.stepi]:
+                if self.raw_steps_residual_config[self.stepi][0] == True:
                     # Compute the full-window attention residual
-                    w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=self.window_size)
+                    window_size = self.raw_steps_residual_config[self.stepi][1]
+                    w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
                     w_residual = all_hidden_states - w_hidden_states
                     if "cfg_attn_share" in method:
                         w_residual = torch.cat([w_residual, w_residual], dim=0)
@@ -127,18 +137,10 @@ class FastAttnProcessor:
                     m.cached_residual = w_residual
                 hidden_states = all_hidden_states
             elif "residual_window_attn" in method:
-                w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=self.window_size)
-
-                # natten 2d
-                # height = int(math.sqrt(query.shape[1]))
-                # weight = height
-                # q_2d = query.permute(0, 2, 1, 3).view(batch_size, m.heads, height, weight, head_dim)
-                # k_2d = key.permute(0, 2, 1, 3).view(batch_size, m.heads, height, weight, head_dim)
-                # v_2d = value.permute(0, 2, 1, 3).view(batch_size, m.heads, height, weight, head_dim)
-                # w_hidden_states = na2d(q_2d, k_2d, v_2d, kernel_size=5)
-
-                # natten 1d
-                # w_hidden_states = na1d(query, key, value, kernel_size=self.window_size[1] * 2 - 1)
+                window_size = int(method.split("_")[-1])
+                w_hidden_states = flash_attn.flash_attn_func(
+                    query, key, value, window_size=(window_size // 2, window_size // 2)
+                )
 
                 if "without_residual" in method:
                     # For ablation study of `residual_window_attn+without_residual`
@@ -171,118 +173,6 @@ class FastAttnProcessor:
 
         return hidden_states
 
-    def sora_attention(self, m, q, k, v, enable_flash_attn, window_size=(-1, -1)):
-        if enable_flash_attn:
-
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            x = flash_attn.flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=m.attn_drop.p if m.training else 0.0,
-                softmax_scale=m.scale,
-                window_size=window_size,
-            )
-        else:
-            dtype = q.dtype
-            q = q * m.scale
-            attn = q @ k.transpose(-2, -1)  # translate attn to float32
-            attn = attn.to(torch.float32)
-            if window_size != (-1, -1):
-                if attn.size() not in self.mask_cache:
-                    mask = (
-                        torch.ones(
-                            attn.size()[-2],
-                            attn.size()[-1],
-                            device=attn.device,
-                            dtype=attn.dtype,
-                        )
-                        * -1e9
-                    )
-                    for i in range(attn.size()[-2]):
-                        mask[
-                            i,
-                            max(0, i + window_size[0]) : min(attn.size()[-1], i + window_size[1]),
-                        ] = 0
-                else:
-                    mask = self.mask_cache[attn.size()]
-                attn += mask
-            attn = attn.softmax(dim=-1)
-            attn = attn.to(dtype)  # cast back attn to original dtype
-            attn = m.attn_drop(attn)
-            x = attn @ v
-        return x
-
-    def run_opensora_forward_method(self, m, hidden_states, encoder_hidden_states, attention_mask, temb, method):
-        if method == "output_share":
-            x = m.cached_output
-        else:
-            if "cfg_attn_share" in method:
-                batch_size = hidden_states.shape[0]
-                if self.cond_first:
-                    diff = hidden_states[: batch_size // 2] - hidden_states[batch_size // 2 :]
-                    hidden_states = hidden_states[: batch_size // 2]
-                else:
-                    diff = hidden_states[batch_size // 2 :] - hidden_states[: batch_size // 2]
-                    hidden_states = hidden_states[batch_size // 2 :]
-                # print(f"cfg_attn_share hidden_states {hidden_states.shape} max_diff={diff.abs().max()}")
-
-                if encoder_hidden_states is not None:
-                    if self.cond_first:
-                        encoder_hidden_states = encoder_hidden_states[: batch_size // 2]
-                    else:
-                        encoder_hidden_states = encoder_hidden_states[batch_size // 2 :]
-                if attention_mask is not None:
-                    if self.cond_first:
-                        attention_mask = attention_mask[: batch_size // 2]
-                    else:
-                        attention_mask = attention_mask[batch_size // 2 :]
-            x = hidden_states
-            B, N, C = x.shape
-            # flash attn is not memory efficient for small sequences, this is empirical
-            enable_flash_attn = m.enable_flash_attn and (N > B)
-            qkv = m.qkv(x)
-            qkv_shape = (B, N, 3, m.num_heads, m.head_dim)
-
-            qkv = qkv.view(qkv_shape).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv.unbind(0)
-            # WARNING: this may be a bug
-            if m.rope:
-                q = m.rotary_emb(q)
-                k = m.rotary_emb(k)
-            q, k = m.q_norm(q), m.k_norm(k)
-
-            if "full_attn" in method:
-                x = self.sora_attention(m, q, k, v, enable_flash_attn)
-
-                if self.need_compute_residual[m.stepi]:
-                    w_x = self.sora_attention(m, q, k, v, enable_flash_attn, window_size=self.window_size)
-                    # w_x=flash_attn.flash_attn_func(q, k, v,window_size=self.window_size,softmax_scale=m.scale)
-                    residual = x - w_x
-                    if "cfg_attn_share" in method:
-                        residual = torch.cat([residual, residual], dim=0)
-                    m.cached_residual = residual
-            elif "residual_window_attn" in method:
-                w_x = self.sora_attention(m, q, k, v, enable_flash_attn, window_size=self.window_size)
-                # w_x=flash_attn.flash_attn_func(q, k, v,window_size=self.window_size,softmax_scale=m.scale)
-                x = w_x + m.cached_residual[:B].view_as(w_x)
-
-            x_output_shape = (B, N, C)
-            if not enable_flash_attn:
-                x = x.transpose(1, 2)
-            x = x.reshape(x_output_shape)
-            x = m.proj(x)
-            x = m.proj_drop(x)
-
-            if "cfg_attn_share" in method:
-                x = torch.cat([x, x], dim=0)
-
-            if self.need_cache_output:
-                m.cached_output = x
-        return x
-
     def __call__(
         self,
         attn: Attention,
@@ -300,7 +190,7 @@ class FastAttnProcessor:
                 encoder_hidden_states,
                 attention_mask,
                 temb,
-                self.steps_method[attn.stepi],
+                self.steps_method[self.stepi],
             )
         else:
             hidden_states = self.run_forward_method(
@@ -309,8 +199,8 @@ class FastAttnProcessor:
                 encoder_hidden_states,
                 attention_mask,
                 temb,
-                self.steps_method[attn.stepi],
+                self.steps_method[self.stepi],
             )
         # After been call once, add the timestep index of this attention module by 1
-        attn.stepi += 1
+        self.stepi += 1
         return hidden_states
