@@ -8,7 +8,7 @@ class DiTFastAttnFFN(nn.Module):
         super().__init__()
         self.raw_module = raw_module
         self.steps_method = steps_method
-        self.stepi = None
+        self.stepi = 0
         self.cache_output = None
 
         self.cond_first = cond_first
@@ -34,5 +34,4 @@ class DiTFastAttnFFN(nn.Module):
             out = self.raw_module(hidden_states)
         if self.need_cache_output:
             self.cache_output = out
-        self.stepi += 1
         return out

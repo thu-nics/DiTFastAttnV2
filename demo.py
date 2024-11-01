@@ -15,9 +15,10 @@ print("raw latency", latency)
 
 for layer_name in dfa_config.layer_names:
     candidates = dfa_config.get_available_candidates(layer_name)
-    for step_i in range(1, n_steps - 1):
+    for step_i in range(1, n_steps):
         # random select one candidate
         choice = random.choice(candidates)
+        # choice = "output_share"
         dfa_config.set_layer_step_method(layer_name, step_i, choice)
         # print(f"Set {layer_name} step {step_i} to {choice}")
 dfa_config.apply_configs(verbose=True)

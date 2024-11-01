@@ -1,5 +1,5 @@
 import torch
-from diffusers.models.attention_processor import Attention, AttnProcessor2_0
+from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
 from typing import Optional
 import torch.nn.functional as F
 import flash_attn
@@ -227,83 +227,7 @@ class DiTFastAttnProcessor:
                 self.steps_method[self.stepi],
             )
         # After been call once, add the timestep index of this attention module by 1
-        self.stepi += 1
         return hidden_states
-
-
-class JointAttnProcessor2_0:
-    """Attention processor used typically in processing the SD3-like self-attention projections."""
-
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        *args,
-        **kwargs,
-    ) -> torch.FloatTensor:
-        residual = hidden_states
-
-        input_ndim = hidden_states.ndim
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-        context_input_ndim = encoder_hidden_states.ndim
-        if context_input_ndim == 4:
-            batch_size, channel, height, width = encoder_hidden_states.shape
-            encoder_hidden_states = encoder_hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-
-        batch_size = encoder_hidden_states.shape[0]
-
-        # `sample` projections.
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-        # `context` projections.
-        encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
-        encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
-        encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
-
-        # attention
-        query = torch.cat([query, encoder_hidden_states_query_proj], dim=1)
-        key = torch.cat([key, encoder_hidden_states_key_proj], dim=1)
-        value = torch.cat([value, encoder_hidden_states_value_proj], dim=1)
-
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-        hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
-
-        # Split the attention outputs.
-        hidden_states, encoder_hidden_states = (
-            hidden_states[:, : residual.shape[1]],
-            hidden_states[:, residual.shape[1] :],
-        )
-
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-        if not attn.context_pre_only:
-            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
-
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-        if context_input_ndim == 4:
-            encoder_hidden_states = encoder_hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-
-        return hidden_states, encoder_hidden_states
 
 
 flex_kernels = {}
@@ -322,14 +246,7 @@ class MMDiTFastAttnProcessor:
         self.stepi = 0
 
         # flex attn kernel compile
-        kernel_name = "window_640"
-        if kernel_name in flex_kernels.keys():
-            self.window_func, self.block_mask = flex_kernels[kernel_name]
-        else:
-            sliding_window_mask = generate_partial_sliding_window(window_size=640, vtok_len=4096)
-            self.block_mask = create_block_mask(sliding_window_mask, 2, 16, 4096, 4096, device="cuda", _compile=True)
-            self.window_func = torch.compile(partial(flex_attention, block_mask=self.block_mask))
-            flex_kernels[kernel_name] = self.window_func, self.block_mask
+        kernel_name = "window_160"
 
     def update_config(self, **kwargs):
         for key, value in kwargs.items():
@@ -438,10 +355,22 @@ class MMDiTFastAttnProcessor:
                 if self.raw_steps_residual_config[self.stepi][0] == True:
                     # Compute the full-window attention residual
                     # partial window attn using flex attn
+                    B, S, H, D = query.shape
+                    kernel_name = f"flex_window_{B}_{S}_{H}"
+                    if kernel_name not in flex_kernels:
+                        assert D in [2**_ for _ in range(1, 10)]
+                        print(f"Compile {kernel_name} kernel")
+                        sliding_window_mask = generate_partial_sliding_window(window_size=160, vtok_len=S - 333)
+                        block_mask = create_block_mask(sliding_window_mask, B, H, S, S, device="cuda", _compile=True)
+                        window_func = torch.compile(partial(flex_attention, block_mask=block_mask))
+                        flex_kernels[kernel_name] = (window_func, block_mask)
+                    else:
+                        window_func, block_mask = flex_kernels[kernel_name]
 
-                    w_hidden_states = self.window_func(
-                        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
+                    w_hidden_states = window_func(
+                        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=block_mask
                     ).transpose(1, 2)
+                    torch.cuda.synchronize()
 
                     # window_size = self.raw_steps_residual_config[self.stepi][1]
                     # w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
@@ -452,9 +381,14 @@ class MMDiTFastAttnProcessor:
                     m.cached_residual = w_residual
                 hidden_states = all_hidden_states
             elif "residual_window_attn" in method:
-                w_hidden_states = self.window_func(
-                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
+                B, S, H, D = query.shape
+                kernel_name = f"flex_window_{B}_{S}_{H}"
+                window_func, block_mask = flex_kernels[kernel_name]
+
+                w_hidden_states = window_func(
+                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=block_mask
                 ).transpose(1, 2)
+                torch.cuda.synchronize()
                 # window_size = int(method.split("_")[-1])
                 # w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
 
@@ -519,5 +453,4 @@ class MMDiTFastAttnProcessor:
             self.steps_method[self.stepi],
         )
         # After been call once, add the timestep index of this attention module by 1
-        self.stepi += 1
         return hidden_states

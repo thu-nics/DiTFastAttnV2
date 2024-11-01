@@ -136,6 +136,7 @@ data/yolov5
 /hmodelzoo
 hmodelzoo/
 /hmodel
+models
 mqbench
 hmodel
 model_zoo
