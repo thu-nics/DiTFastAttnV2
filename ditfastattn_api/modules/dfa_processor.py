@@ -46,6 +46,7 @@ class DiTFastAttnProcessor:
         self.need_cache_output = True
         self.mask_cache = {}
         self.stepi = 0
+        self.cached_output = None
 
     def update_config(self, **kwargs):
         for key, value in kwargs.items():
@@ -75,7 +76,7 @@ class DiTFastAttnProcessor:
     def run_forward_method(self, m, hidden_states, encoder_hidden_states, attention_mask, temb, method):
         residual = hidden_states
         if method == "output_share":
-            hidden_states = m.cached_output
+            hidden_states = self.cached_output
         else:
             if "cfg_attn_share" in method:
                 # Directly use the unconditional branch's attention output
@@ -189,7 +190,7 @@ class DiTFastAttnProcessor:
                 hidden_states = torch.cat([hidden_states, hidden_states], dim=0)
 
             if self.need_cache_output:
-                m.cached_output = hidden_states
+                self.cached_output = hidden_states
 
         if m.residual_connection:
             hidden_states = hidden_states + residual
@@ -243,6 +244,7 @@ class MMDiTFastAttnProcessor:
         self.raw_steps_residual_config = self.compute_raw_steps_residual_config(steps_method)
         self.need_cache_output = True
         self.mask_cache = {}
+        self.cached_output = None
         self.stepi = 0
 
         # flex attn kernel compile
@@ -288,7 +290,7 @@ class MMDiTFastAttnProcessor:
         batch_size = encoder_hidden_states.shape[0]
 
         if method == "output_share":
-            hidden_states, encoder_hidden_states = m.cached_output
+            hidden_states, encoder_hidden_states = self.cached_output
         else:
             if "cfg_attn_share" in method:
                 # Directly use the unconditional branch's attention output
@@ -431,7 +433,7 @@ class MMDiTFastAttnProcessor:
                 )
 
             if self.need_cache_output:
-                m.cached_output = hidden_states, encoder_hidden_states
+                self.cached_output = hidden_states, encoder_hidden_states
 
         return hidden_states, encoder_hidden_states
 

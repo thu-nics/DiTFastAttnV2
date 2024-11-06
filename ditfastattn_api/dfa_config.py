@@ -1,6 +1,7 @@
-DEFAULT_ATTN_CANDIDATES = ["raw", "output_share", "residual_window_attn_128", "residual_window_attn_256"]
+# DEFAULT_ATTN_CANDIDATES = ["output_share", "residual_window_attn_128", "residual_window_attn_256"]
+DEFAULT_ATTN_CANDIDATES = ["output_share"]
 # DEFAULT_ATTN_CANDIDATES = ["raw", "output_share"]
-DEFAULT_FFN_CANDIDATES = ["raw", "output_share"]
+DEFAULT_FFN_CANDIDATES = ["output_share"]
 import copy
 
 
@@ -29,6 +30,7 @@ class DiTFastAttnConfig:
 
     def set_layer_step_method(self, layer_name, step_idx, method):
         self.layers[layer_name]["kwargs"]["steps_method"][step_idx] = method
+        self.layers[layer_name]["obj"].update_config(steps_method=self.layers[layer_name]["kwargs"]["steps_method"])
 
     def set_layer_config(self, layer_name, **kwargs):
         for key, value in kwargs.items():

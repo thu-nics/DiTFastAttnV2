@@ -10,7 +10,7 @@ attn_class = Attention
 ffn_class = FeedForward
 
 
-def dit_inference_with_backward(
+def inference_fn_with_backward(
     pipe: DiTPipeline,
     class_labels: List[int],
     guidance_scale: float = 4.0,
@@ -86,7 +86,7 @@ def dit_inference_with_backward(
 
 
 @torch.no_grad()
-def dit_inference_with_timeinfo(
+def inference_with_timeinfo(
     pipe: DiTPipeline,
     class_labels: List[int],
     guidance_scale: float = 4.0,
@@ -134,6 +134,11 @@ def dit_inference_with_timeinfo(
         # predict noise model_output
         for name, module in pipe.transformer.named_modules():
             module.timestep_index = timestep_index
+            if hasattr(module, "stepi"):
+                module.stepi = timestep_index
+            if isinstance(module, attn_class):
+                module.processor.stepi = timestep_index
+
         noise_pred = pipe.transformer(latent_model_input, timestep=timesteps, class_labels=class_labels_input).sample
 
         # perform guidance

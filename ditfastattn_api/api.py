@@ -34,7 +34,10 @@ def transform_model_dfa(model, n_steps=20):
             if isinstance(module.ff, FeedForward):
                 module.ff = DiTFastAttnFFN(module.ff, steps_method=["raw" for _ in range(n_steps)])
                 dfa_config.add_ffn_layer(name + ".ff", module.ff)
+    return dfa_config
 
+
+def register_refresh_stepi_hook(model, n_steps):
     def refresh_stepi_hook(module, input, output):
         for name, module in module.named_modules():
             if hasattr(module, "stepi"):
@@ -49,7 +52,6 @@ def transform_model_dfa(model, n_steps=20):
                 # print(f"stepi of {name}.attn is {module.processor.stepi}")
 
     model.register_forward_hook(refresh_stepi_hook)
-    return dfa_config
 
 
 def transformer_input_hook(module, arg, kwargs, output):

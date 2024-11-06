@@ -33,7 +33,13 @@ def get_layer_fisher_info(pipe, dataloader, model_misc):
     for hook in all_hooks:
         hook.remove()
 
-    return layer_gradients
+    layer_fisher_info = {}
+    for timestep_index, step_gradients in layer_gradients.items():
+        layer_fisher_info[timestep_index] = {}
+        for layer_name, gradient in step_gradients.items():
+            layer_fisher_info[timestep_index][layer_name] = gradient.pow(2)
+
+    return layer_fisher_info
 
 
 def get_compression_method_influence(pipe, dfa_config, dataloader, layer_fisher_info, model_misc):
@@ -41,20 +47,29 @@ def get_compression_method_influence(pipe, dfa_config, dataloader, layer_fisher_
 
     def collect_compression_influence_hook(m, input, kwargs, output):
         candidates = dfa_config.get_available_candidates(m.name)
-        for candidate in candidates:
-            dfa_config.set_layer_step_method(m.name, m.timestep_index, candidate)
-            new_output = m.forward(*input, **kwargs)
-            fisher_info = layer_fisher_info[m.timestep_index][m.name]
-            influence = ((new_output - output).pow(2).sum(0) * fisher_info).sum()
-            if m.name not in layer_compression_influences:
-                layer_compression_influences[m.name] = {}
-            if m.timestep_index not in layer_compression_influences[m.name]:
-                layer_compression_influences[m.name][m.timestep_index] = {}
-            if candidate not in layer_compression_influences[m.name][m.timestep_index]:
-                layer_compression_influences[m.name][m.timestep_index][candidate] = 0
-            layer_compression_influences[m.name][m.timestep_index][candidate] += influence
-            print(f"time {m.timestep_index} layer {m.name} candidate {candidate} influence {influence}")
-            dfa_config.set_layer_step_method(m.name, m.timestep_index, "raw")
+
+        if m.timestep_index != 0:
+            # the first step cannot take use of the preivous step's output
+            for candidate in candidates:
+                dfa_config.set_layer_step_method(m.name, m.timestep_index, candidate)
+                new_output = m.forward(*input, **kwargs).float()
+                fisher_info = layer_fisher_info[m.timestep_index][m.name]
+                influence = ((new_output - output.float()).pow(2).sum(0) * fisher_info).sum()
+                if m.name not in layer_compression_influences:
+                    layer_compression_influences[m.name] = {}
+                if m.timestep_index not in layer_compression_influences[m.name]:
+                    layer_compression_influences[m.name][m.timestep_index] = {}
+                if candidate not in layer_compression_influences[m.name][m.timestep_index]:
+                    layer_compression_influences[m.name][m.timestep_index][candidate] = 0
+                layer_compression_influences[m.name][m.timestep_index][candidate] += influence
+                print(f"time {m.timestep_index} layer {m.name} candidate {candidate} influence {influence}")
+                dfa_config.set_layer_step_method(m.name, m.timestep_index, "raw")
+
+        # manually cache the output for DiTFastAttnFFN and DiTFastAttnProcessor
+        if isinstance(m, DiTFastAttnFFN):
+            m.cache_output = output
+        elif isinstance(m, model_misc.attn_class):
+            m.processor.cached_output = output
 
     all_hooks = []
     for name, module in pipe.transformer.named_modules():
@@ -64,13 +79,14 @@ def get_compression_method_influence(pipe, dfa_config, dataloader, layer_fisher_
             if isinstance(module.attn1, model_misc.attn_class):
                 hook = module.attn1.register_forward_hook(collect_compression_influence_hook, with_kwargs=True)
                 all_hooks.append(hook)
+                module.attn1.processor.need_cache_output = False
             if isinstance(module.ff, DiTFastAttnFFN):
                 hook = module.ff.register_forward_hook(collect_compression_influence_hook, with_kwargs=True)
                 all_hooks.append(hook)
-
+                module.ff.need_cache_output = False
     for i, (args, kwargs) in enumerate(dataloader()):
         print(f">>> compression influence sample {i} <<<")
-        model_misc.dit_inference_with_timeinfo(pipe, *args, **kwargs)
+        model_misc.inference_with_timeinfo(pipe, *args, **kwargs)
 
     # remove hooks
     for hook in all_hooks:
