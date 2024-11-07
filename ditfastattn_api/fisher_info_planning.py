@@ -62,7 +62,7 @@ def get_compression_method_influence(pipe, dfa_config, dataloader, layer_fisher_
                 if candidate not in layer_compression_influences[m.name][m.timestep_index]:
                     layer_compression_influences[m.name][m.timestep_index][candidate] = 0
                 layer_compression_influences[m.name][m.timestep_index][candidate] += influence
-                print(f"time {m.timestep_index} layer {m.name} candidate {candidate} influence {influence}")
+                # print(f"time {m.timestep_index} layer {m.name} candidate {candidate} influence {influence}")
                 dfa_config.set_layer_step_method(m.name, m.timestep_index, "raw")
 
         # manually cache the output for DiTFastAttnFFN and DiTFastAttnProcessor

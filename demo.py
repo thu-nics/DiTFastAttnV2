@@ -16,12 +16,12 @@ import random
 import numpy as np
 
 model_id = "facebook/DiT-XL-2-512"
-seed = 3
-n_steps = 5
-calib_x = torch.randint(0, 1000, (1,), generator=torch.Generator().manual_seed(seed)).to("cuda")
+seed = 9
+n_steps = 20
+calib_x = torch.randint(0, 1000, (6,), generator=torch.Generator().manual_seed(seed)).to("cuda")
 pipe = DiTPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
 
-n_samples = 1
+n_samples = 3
 model_misc = dit_misc
 
 
@@ -45,16 +45,27 @@ layer_compression_influences = get_compression_method_influence(
     pipe, dfa_config, dataloader, layer_gradients, model_misc
 )
 
-for threshold in np.linspace(0.1, 0.9, 9):
+
+# plot to one figure
+import matplotlib.pyplot as plt
+
+# width 9 subplots
+fig, axs = plt.subplots(1, 9, figsize=(20, 15))  # figsize width=20
+
+for i, threshold in enumerate(np.linspace(0, 0.4, 9)):
     unregister_refresh_stepi_hook(pipe.transformer)
     compress_methods = fisher_info_planning(layer_compression_influences, dfa_config, threshold)
-    latency = dfa_test_latency(pipe, calib_x, num_inference_steps=n_steps)
     register_refresh_stepi_hook(pipe.transformer, n_steps)
+    latency = dfa_test_latency(pipe, calib_x, num_inference_steps=n_steps)
     # generate a image
     generator = torch.Generator().manual_seed(seed)
-    image = pipe(calib_x, num_inference_steps=n_steps, generator=generator).images[0]
-    image.save(f"output/{model_id.replace('/', '_')}_threshold_{threshold}.png")
-    print(f"threshold {threshold} latency {latency}")
+    # height stack batch images
+    images = pipe(calib_x, num_inference_steps=n_steps, generator=generator).images
+    image = torch.cat(images, dim=0)
+    axs[i].imshow(image)
+    axs[i].set_title(f"threshold {threshold} latency {latency:.2f}s")
+    axs[i].axis("off")
+plt.savefig(f"output/{model_id.replace('/', '_')}_fisher_info_planning.png")
 
 # for layer_name in dfa_config.layer_names:
 #     candidates = dfa_config.get_available_candidates(layer_name)
