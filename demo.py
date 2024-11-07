@@ -1,4 +1,9 @@
-from ditfastattn_api.api import transform_model_dfa, dfa_test_latency
+from ditfastattn_api.api import (
+    transform_model_dfa,
+    dfa_test_latency,
+    register_refresh_stepi_hook,
+    unregister_refresh_stepi_hook,
+)
 from diffusers import DiTPipeline, AutoPipelineForText2Image
 from ditfastattn_api.fisher_info_planning import (
     fisher_info_planning,
@@ -8,6 +13,7 @@ from ditfastattn_api.fisher_info_planning import (
 import ditfastattn_api.models.dit_misc as dit_misc
 import torch
 import random
+import numpy as np
 
 model_id = "facebook/DiT-XL-2-512"
 seed = 3
@@ -39,7 +45,16 @@ layer_compression_influences = get_compression_method_influence(
     pipe, dfa_config, dataloader, layer_gradients, model_misc
 )
 
-breakpoint()
+for threshold in np.linspace(0.1, 0.9, 9):
+    unregister_refresh_stepi_hook(pipe.transformer)
+    compress_methods = fisher_info_planning(layer_compression_influences, dfa_config, threshold)
+    latency = dfa_test_latency(pipe, calib_x, num_inference_steps=n_steps)
+    register_refresh_stepi_hook(pipe.transformer, n_steps)
+    # generate a image
+    generator = torch.Generator().manual_seed(seed)
+    image = pipe(calib_x, num_inference_steps=n_steps, generator=generator).images[0]
+    image.save(f"output/{model_id.replace('/', '_')}_threshold_{threshold}.png")
+    print(f"threshold {threshold} latency {latency}")
 
 # for layer_name in dfa_config.layer_names:
 #     candidates = dfa_config.get_available_candidates(layer_name)

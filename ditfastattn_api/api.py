@@ -51,7 +51,21 @@ def register_refresh_stepi_hook(model, n_steps):
                     module.processor.stepi = 0
                 # print(f"stepi of {name}.attn is {module.processor.stepi}")
 
-    model.register_forward_hook(refresh_stepi_hook)
+    hook = model.register_forward_hook(refresh_stepi_hook)
+    model.refresh_stepi_hook = hook
+
+    # reset the stepi of all the attention and ffn layers
+    for name, module in model.named_modules():
+        if isinstance(module, Attention):
+            module.processor.stepi = 0
+        if isinstance(module, DiTFastAttnFFN):
+            module.stepi = 0
+
+
+def unregister_refresh_stepi_hook(model):
+    if hasattr(model, "refresh_stepi_hook"):
+        model.refresh_stepi_hook.remove()
+        delattr(model, "refresh_stepi_hook")
 
 
 def transformer_input_hook(module, arg, kwargs, output):

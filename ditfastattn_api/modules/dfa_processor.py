@@ -194,7 +194,6 @@ class DiTFastAttnProcessor:
 
         if m.residual_connection:
             hidden_states = hidden_states + residual
-
         hidden_states = hidden_states / m.rescale_output_factor
 
         return hidden_states

@@ -92,13 +92,35 @@ def get_compression_method_influence(pipe, dfa_config, dataloader, layer_fisher_
     for hook in all_hooks:
         hook.remove()
 
+    for name, module in pipe.transformer.named_modules():
+        if isinstance(module, model_misc.block_class):
+            if isinstance(module.attn1, model_misc.attn_class):
+                module.attn1.processor.need_cache_output = True
+            if isinstance(module.ff, DiTFastAttnFFN):
+                module.ff.need_cache_output = True
+
     return layer_compression_influences
 
 
-def fisher_info_planning(
-    layer_fisher_info,
-):
-    layer_fisher_info = get_layer_fisher_info(model, calib_x, n_steps)
-    breakpoint()
-    1 == 1
-    pass
+def fisher_info_planning(layer_compression_influences, dfa_config, threshold=0.8):
+    # sort all of the layer_compression_influences by the influence
+    sorted_layer_compression_influences = []
+    for layer_name, step_influences in layer_compression_influences.items():
+        for step_index, influence_dict in step_influences.items():
+            for candidate, influence in influence_dict.items():
+                sorted_layer_compression_influences.append((layer_name, step_index, candidate, influence))
+    sorted_layer_compression_influences.sort(key=lambda x: x[3])
+
+    # apply the sorted layer_compression_influences to the dfa_config
+    n_compress = int(len(sorted_layer_compression_influences) * threshold)
+    compress_methods = {}
+    for layer_name, step_index, candidate, influence in sorted_layer_compression_influences[:n_compress]:
+        if (layer_name, step_index) not in compress_methods:
+            compress_methods[(layer_name, step_index)] = candidate
+        else:
+            # TODO: set according to the cost of the candidate method
+            compress_methods[(layer_name, step_index)] = candidate
+    for (layer_name, step_index), candidate in compress_methods.items():
+        dfa_config.set_layer_step_method(layer_name, step_index, candidate)
+    print(dfa_config)
+    return compress_methods
