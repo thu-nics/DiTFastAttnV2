@@ -38,6 +38,14 @@ class DiTFastAttnConfig:
                 raise ValueError(f"{key} is not a valid attribute for {layer_name}")
             self.layers[layer_name]["kwargs"][key] = value
 
+    def get_layer_step_method(self, layer_name, step_idx):
+        return self.layers[layer_name]['kwargs']['steps_method'][step_idx]
+
+    # reset all layer method to raw for a designated step
+    def reset_step_method(self, step_idx):
+        for layer_name in self.layers.keys():
+            self.set_layer_step_method(layer_name, step_idx, "raw")
+
     @property
     def layer_names(self):
         return list(self.layers.keys())
