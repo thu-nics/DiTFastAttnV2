@@ -30,7 +30,7 @@ model_misc = dit_misc
 def dataloader():
     generator = torch.Generator().manual_seed(seed)
     for _ in range(n_samples):
-        calib_x = torch.randint(0, 1000, (6,), generator=generator).to("cuda")
+        calib_x = torch.randint(0, 1000, (3,), generator=generator).to("cuda")
         yield [calib_x], {"num_inference_steps": n_steps}
 
 
@@ -63,7 +63,7 @@ from PIL import Image
 # width 9 subplots
 fig, axs = plt.subplots(1, 9, figsize=(20, 15))  # figsize width=20
 
-for i, threshold in enumerate(np.linspace(0, 0.6, 9)):
+for i, threshold in enumerate(np.linspace(0, 0.09, 9)):
 # for i, threshold in enumerate([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.15, 0.175, 0.2]):
     # add
     # pipe = DiTPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
@@ -76,8 +76,10 @@ for i, threshold in enumerate(np.linspace(0, 0.6, 9)):
     # add
     unregister_refresh_stepi_hook(pipe.transformer)
     # compress_methods = fisher_info_planning(layer_compression_influences, dfa_config, threshold)
+    pipe.transformer.to(torch.bfloat16)
     update_layer_influence_new(pipe, dataloader, dfa_config, model_misc, alpha = threshold)
     print(dfa_config)
+    pipe.transformer.to(torch.float16)
     unregister_refresh_stepi_hook(pipe.transformer)
     register_refresh_stepi_hook(pipe.transformer, n_steps)
     latency = dfa_test_latency(pipe, calib_x, num_inference_steps=n_steps)

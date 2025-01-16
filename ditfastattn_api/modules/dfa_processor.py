@@ -4,6 +4,7 @@ from typing import Optional
 import torch.nn.functional as F
 import flash_attn
 import copy
+from time import time
 
 # from natten.functional import na1d, na2d
 import torch.nn as nn
@@ -12,9 +13,8 @@ from torch.nn.attention.flex_attention import _mask_mod_signature, or_masks
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from functools import partial
 
-
 # flex attn partial window attention
-def generate_partial_sliding_window(window_size: int, vtok_len: int) -> _mask_mod_signature:
+def generate_partial_sliding_window(window_size: int, vtok_len: int, block_size=64) -> _mask_mod_signature:
     """Generates a sliding window attention mask with a given window size.
     Args:
         window_size: The size of the sliding window.
@@ -25,15 +25,14 @@ def generate_partial_sliding_window(window_size: int, vtok_len: int) -> _mask_mo
     """
 
     def sliding_window_with_offset(b, h, q_idx, kv_idx):
-        return torch.abs(q_idx - kv_idx) <= window_size // 2
+        return (torch.abs(q_idx - kv_idx) <= window_size // 2) | (q_idx >= vtok_len) | (kv_idx >= vtok_len)
 
-    def partial_full(b, h, q_idx, kv_idx):
-        return (q_idx >= vtok_len) | (kv_idx >= vtok_len)
-
-    sliding_window_mask = or_masks(partial_full, sliding_window_with_offset)
+    sliding_window_mask = sliding_window_with_offset
     sliding_window_mask.__name__ = f"sliding_window_{window_size}"
     return sliding_window_mask
 
+def flex_attn_block_mask_wrapper(q, k, v, block_mask):
+    return flex_attention(q, k, v, block_mask=block_mask)
 
 class DiTFastAttnProcessor:
     def __init__(self, steps_method=None, cond_first=None):
@@ -44,9 +43,11 @@ class DiTFastAttnProcessor:
         # of this attention module
         self.raw_steps_residual_config = self.compute_raw_steps_residual_config(steps_method)
         self.need_cache_output = True
+        self.cache_residual_forced = False
         self.mask_cache = {}
         self.stepi = 0
         self.cached_output = None
+        self.dfa_config = None
 
     def update_config(self, **kwargs):
         for key, value in kwargs.items():
@@ -55,7 +56,7 @@ class DiTFastAttnProcessor:
 
     def compute_raw_steps_residual_config(self, steps_method):
         steps_residual_config = []
-        assert steps_method[0] == "raw", "The first step of DiTFastAttnProcessor must be raw"
+        # assert steps_method[0] == "raw", "The first step of DiTFastAttnProcessor must be raw"
         for i, method in enumerate(steps_method):
             residual_config = (False, None)
             if "raw" in method:
@@ -161,6 +162,15 @@ class DiTFastAttnProcessor:
                         w_residual = torch.cat([w_residual, w_residual], dim=0)
                     # Save the residual for usage in follow-up steps
                     m.cached_residual = w_residual
+                elif self.cache_residual_forced:
+                    # Compute the full-window attention residual
+                    window_size = [64, 64]
+                    w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
+                    w_residual = all_hidden_states - w_hidden_states
+                    if "cfg_attn_share" in method:
+                        w_residual = torch.cat([w_residual, w_residual], dim=0)
+                    # Save the residual for usage in follow-up steps
+                    m.cached_residual = w_residual
                 hidden_states = all_hidden_states
             elif "residual_window_attn" in method:
                 window_size = int(method.split("_")[-1])
@@ -177,6 +187,7 @@ class DiTFastAttnProcessor:
 
             hidden_states = hidden_states.reshape(batch_size, -1, m.heads * head_dim)
             hidden_states = hidden_states.to(query.dtype)
+
 
             # linear proj
             hidden_states = m.to_out[0](hidden_states)
@@ -234,8 +245,11 @@ flex_kernels = {}
 
 
 class MMDiTFastAttnProcessor:
-    def __init__(self, steps_method=None, cond_first=None):
+    def __init__(self, steps_method=None, cond_first=None, window_func=None):
         self.steps_method = steps_method
+        self.window_func = window_func
+        self.block_mask = None
+        self.cache_residual_forced = False
         # CFG order flag (conditional first or unconditional first)
         self.cond_first = cond_first
         # Check at which timesteps do we need to compute the full-window residual
@@ -245,9 +259,9 @@ class MMDiTFastAttnProcessor:
         self.mask_cache = {}
         self.cached_output = None
         self.stepi = 0
+        self.calib_mode = "off"
+        self.prev_calib_output = None
 
-        # flex attn kernel compile
-        kernel_name = "window_160"
 
     def update_config(self, **kwargs):
         for key, value in kwargs.items():
@@ -256,7 +270,7 @@ class MMDiTFastAttnProcessor:
 
     def compute_raw_steps_residual_config(self, steps_method):
         steps_residual_config = []
-        assert steps_method[0] == "raw", "The first step of DiTFastAttnProcessor must be raw"
+        # assert steps_method[0] == "raw", "The first step of DiTFastAttnProcessor must be raw"
         for i, method in enumerate(steps_method):
             residual_config = (False, None)
             if "raw" in method:
@@ -353,23 +367,39 @@ class MMDiTFastAttnProcessor:
                 ).transpose(1, 2)
             elif "raw" in method:
                 all_hidden_states = flash_attn.flash_attn_func(query, key, value)
-                if self.raw_steps_residual_config[self.stepi][0] == True:
+                if self.cache_residual_forced:
                     # Compute the full-window attention residual
                     # partial window attn using flex attn
                     B, S, H, D = query.shape
-                    kernel_name = f"flex_window_{B}_{S}_{H}"
-                    if kernel_name not in flex_kernels:
-                        assert D in [2**_ for _ in range(1, 10)]
-                        print(f"Compile {kernel_name} kernel")
-                        sliding_window_mask = generate_partial_sliding_window(window_size=160, vtok_len=S - 333)
-                        block_mask = create_block_mask(sliding_window_mask, B, H, S, S, device="cuda", _compile=True)
-                        window_func = torch.compile(partial(flex_attention, block_mask=block_mask))
-                        flex_kernels[kernel_name] = (window_func, block_mask)
-                    else:
-                        window_func, block_mask = flex_kernels[kernel_name]
+                    if self.block_mask is None:
+                        print(f"Compile window attention kernel 1")
+                        sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // 8, vtok_len=S - 333)
+                        block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+                        self.block_mask = block_mask
+                    w_hidden_states = self.window_func(
+                        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
+                    ).transpose(1, 2)
+                    torch.cuda.synchronize()
 
-                    w_hidden_states = window_func(
-                        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=block_mask
+                    # window_size = self.raw_steps_residual_config[self.stepi][1]
+                    # w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
+                    w_residual = all_hidden_states - w_hidden_states
+                    if "cfg_attn_share" in method:
+                        w_residual = torch.cat([w_residual, w_residual], dim=0)
+                    # Save the residual for usage in follow-up steps
+                    m.cached_residual = w_residual.detach()
+                elif self.raw_steps_residual_config[self.stepi][0] == True:
+                    # Compute the full-window attention residual
+                    # partial window attn using flex attn
+                    B, S, H, D = query.shape
+                    if self.block_mask is None:
+                        print(f"Compile window attention kernel 2")
+                        sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // 16, vtok_len=S - 333)
+                        block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+                        self.block_mask = block_mask
+                    # breakpoint()
+                    w_hidden_states = self.window_func(
+                        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
                     ).transpose(1, 2)
                     torch.cuda.synchronize()
 
@@ -383,11 +413,11 @@ class MMDiTFastAttnProcessor:
                 hidden_states = all_hidden_states
             elif "residual_window_attn" in method:
                 B, S, H, D = query.shape
-                kernel_name = f"flex_window_{B}_{S}_{H}"
-                window_func, block_mask = flex_kernels[kernel_name]
+                # kernel_name = f"flex_window_{B}_{S}_{H}"
+                # window_func, block_mask = flex_kernels[kernel_name]
 
-                w_hidden_states = window_func(
-                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=block_mask
+                w_hidden_states = self.window_func(
+                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
                 ).transpose(1, 2)
                 torch.cuda.synchronize()
                 # window_size = int(method.split("_")[-1])
@@ -403,11 +433,17 @@ class MMDiTFastAttnProcessor:
             hidden_states = hidden_states.reshape(batch_size, -1, m.heads * head_dim)
             hidden_states = hidden_states.to(query.dtype)
 
+            if self.calib_mode == "get_grad":
+                self.cached_current_output = hidden_states.detach()
+            elif self.calib_mode == "cache_hidden_states":
+                self.prev_calib_output = hidden_states.detach()
+
             # Split the attention outputs.
             hidden_states, encoder_hidden_states = (
                 hidden_states[:, : residual.shape[1]],
                 hidden_states[:, residual.shape[1] :],
             )
+
 
             # linear proj
             hidden_states = m.to_out[0](hidden_states)
@@ -432,9 +468,224 @@ class MMDiTFastAttnProcessor:
                 )
 
             if self.need_cache_output:
-                self.cached_output = hidden_states, encoder_hidden_states
+                self.cached_output = hidden_states.detach(), encoder_hidden_states.detach()
+
 
         return hidden_states, encoder_hidden_states
+    
+    def run_calib_forward_method(self, m, hidden_states, encoder_hidden_states, temb, method, attention_mask=None):
+        residual = hidden_states
+
+        #########################
+        temp_encoder_hidden_states = encoder_hidden_states
+        #########################
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        context_input_ndim = encoder_hidden_states.ndim
+        if context_input_ndim == 4:
+            batch_size, channel, height, width = encoder_hidden_states.shape
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size = encoder_hidden_states.shape[0]
+
+        if method == "output_share":
+            hidden_states, encoder_hidden_states = self.cached_output
+        else:
+            if "cfg_attn_share" in method:
+                # Directly use the unconditional branch's attention output
+                # as the conditional branch's attention output
+
+                # TODO: Maybe use the conditional branch's attention output
+                # as the unconditional's is better
+                batch_size = hidden_states.shape[0]
+                if self.cond_first:
+                    hidden_states = hidden_states[: batch_size // 2]
+                else:
+                    hidden_states = hidden_states[batch_size // 2 :]
+                if encoder_hidden_states is not None:
+                    if self.cond_first:
+                        encoder_hidden_states = encoder_hidden_states[: batch_size // 2]
+                    else:
+                        encoder_hidden_states = encoder_hidden_states[batch_size // 2 :]
+
+            input_ndim = hidden_states.ndim
+
+            if input_ndim == 4:
+                batch_size, channel, height, width = hidden_states.shape
+                hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+            context_input_ndim = encoder_hidden_states.ndim
+            if context_input_ndim == 4:
+                batch_size, channel, height, width = encoder_hidden_states.shape
+                encoder_hidden_states = encoder_hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+            batch_size = encoder_hidden_states.shape[0]
+
+            query = m.to_q(hidden_states)
+            key = m.to_k(hidden_states)
+            value = m.to_v(hidden_states)
+
+            # `context` projections.
+            encoder_hidden_states_query_proj = m.add_q_proj(encoder_hidden_states)
+            encoder_hidden_states_key_proj = m.add_k_proj(encoder_hidden_states)
+            encoder_hidden_states_value_proj = m.add_v_proj(encoder_hidden_states)
+
+            # attention
+            query = torch.cat([query, encoder_hidden_states_query_proj], dim=1)
+            key = torch.cat([key, encoder_hidden_states_key_proj], dim=1)
+            value = torch.cat([value, encoder_hidden_states_value_proj], dim=1)
+
+            inner_dim = key.shape[-1]
+            head_dim = inner_dim // m.heads
+
+            query = query.view(batch_size, -1, m.heads, head_dim)
+            key = key.view(batch_size, -1, m.heads, head_dim)
+            value = value.view(batch_size, -1, m.heads, head_dim)
+
+            if attention_mask is not None:
+                assert "residual_window_attn" not in method
+
+                hidden_states = F.scaled_dot_product_attention(
+                    query.transpose(1, 2),
+                    key.transpose(1, 2),
+                    value.transpose(1, 2),
+                    dropout_p=0.0,
+                    is_causal=False,
+                ).transpose(1, 2)
+            elif "raw" in method:
+                all_hidden_states = flash_attn.flash_attn_func(query, key, value)
+                if self.cache_residual_forced:
+                    # Compute the full-window attention residual
+                    # partial window attn using flex attn
+                    B, S, H, D = query.shape
+                    if self.block_mask is None:
+                        print(f"Compile window attention kernel 1")
+                        sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // 8, vtok_len=S - 333)
+                        block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+                        self.block_mask = block_mask
+                    w_hidden_states = self.window_func(
+                        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
+                    ).transpose(1, 2)
+                    torch.cuda.synchronize()
+
+                    # window_size = self.raw_steps_residual_config[self.stepi][1]
+                    # w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
+                    w_residual = all_hidden_states - w_hidden_states
+                    if "cfg_attn_share" in method:
+                        w_residual = torch.cat([w_residual, w_residual], dim=0)
+                    # Save the residual for usage in follow-up steps
+                    m.cached_residual = w_residual.detach()
+                elif self.raw_steps_residual_config[self.stepi][0] == True:
+                    # Compute the full-window attention residual
+                    # partial window attn using flex attn
+                    B, S, H, D = query.shape
+                    if self.block_mask is None:
+                        print(f"Compile window attention kernel 2")
+                        sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // 16, vtok_len=S - 333)
+                        block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+                        self.block_mask = block_mask
+                    # breakpoint()
+                    w_hidden_states = self.window_func(
+                        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
+                    ).transpose(1, 2)
+                    torch.cuda.synchronize()
+
+                    # window_size = self.raw_steps_residual_config[self.stepi][1]
+                    # w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
+                    w_residual = all_hidden_states - w_hidden_states
+                    if "cfg_attn_share" in method:
+                        w_residual = torch.cat([w_residual, w_residual], dim=0)
+                    # Save the residual for usage in follow-up steps
+                    m.cached_residual = w_residual
+                hidden_states = all_hidden_states
+            elif "residual_window_attn" in method:
+                B, S, H, D = query.shape
+                # kernel_name = f"flex_window_{B}_{S}_{H}"
+                # window_func, block_mask = flex_kernels[kernel_name]
+
+                w_hidden_states = self.window_func(
+                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
+                ).transpose(1, 2)
+                torch.cuda.synchronize()
+                # window_size = int(method.split("_")[-1])
+                # w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
+
+                if "without_residual" in method:
+                    # For ablation study of `residual_window_attn+without_residual`
+                    # v.s. `residual_window_attn`
+                    hidden_states = w_hidden_states
+                else:
+                    hidden_states = w_hidden_states + m.cached_residual[:batch_size].view_as(w_hidden_states)
+
+            hidden_states = hidden_states.reshape(batch_size, -1, m.heads * head_dim)
+            hidden_states = hidden_states.to(query.dtype)
+
+
+            #############################################################################
+            # calib mode, cache hidden_states, register backward hook and get gradient
+            self.cached_current_output = hidden_states.detach()
+
+            self.hidden_states_grad = None
+            def hook(grad):
+                if m.timestep_index != 0:
+                    candidates = self.dfa_config.get_available_candidates(m.name)
+                    temp_current_output = self.cached_current_output
+                    for candidate in candidates:
+                        self.dfa_config.set_layer_step_method(m.name, m.timestep_index, candidate)
+                        if candidate == 'output_share':
+                            influence = ((self.prev_calib_output.float() - temp_current_output.float()) * grad[0].detach()).sum().abs().cpu().numpy()
+                        else:
+                            with torch.no_grad():
+                                self.run_forward_method(m, residual, temp_encoder_hidden_states, temb, candidate, attention_mask)
+                            influence = ((self.cached_current_output.float() - temp_current_output.float()) * grad[0].detach()).sum().abs().cpu().numpy()
+                        if candidate not in m.compression_influences:
+                            m.compression_influences[candidate] = 0
+                        m.compression_influences[candidate] += influence
+                        # print(f"m name {m.name}, candidate {candidate}, influence: {influence}")
+                    self.dfa_config.set_layer_step_method(m.name, m.timestep_index, "raw")
+
+            
+            hidden_states.register_hook(hook)
+
+            #############################################################################
+
+            # Split the attention outputs.
+            hidden_states, encoder_hidden_states = (
+                hidden_states[:, : residual.shape[1]],
+                hidden_states[:, residual.shape[1] :],
+            )
+
+
+            # linear proj
+            hidden_states = m.to_out[0](hidden_states)
+            # dropout
+            hidden_states = m.to_out[1](hidden_states)
+
+            if input_ndim == 4:
+                hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+            if "cfg_attn_share" in method:
+                hidden_states = torch.cat([hidden_states, hidden_states], dim=0)
+                encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states], dim=0)
+
+            if not m.context_pre_only:
+                encoder_hidden_states = m.to_add_out(encoder_hidden_states)
+
+            if input_ndim == 4:
+                hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+            if context_input_ndim == 4:
+                encoder_hidden_states = encoder_hidden_states.transpose(-1, -2).reshape(
+                    batch_size, channel, height, width
+                )
+
+            if self.need_cache_output:
+                self.cached_output = hidden_states.detach(), encoder_hidden_states.detach()
+
+
+        return hidden_states, encoder_hidden_states
+
 
     def __call__(
         self,
@@ -446,12 +697,46 @@ class MMDiTFastAttnProcessor:
         *args,
         **kwargs,
     ) -> torch.FloatTensor:
-        hidden_states = self.run_forward_method(
+        if self.calib_mode == "get_grad":
+            hidden_states = self.run_calib_forward_method(
             attn,
             hidden_states,
             encoder_hidden_states,
             temb,
             self.steps_method[self.stepi],
-        )
+            )
+        else:
+            hidden_states = self.run_forward_method(
+                attn,
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                self.steps_method[self.stepi],
+            )
         # After been call once, add the timestep index of this attention module by 1
         return hidden_states
+
+
+    def get_latency(self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        temb: Optional[torch.FloatTensor] = None,
+        iter: int = 100,
+        *args,
+        **kwargs,
+    ):
+        st = time()
+        for i in range(iter):
+            self.run_forward_method(
+                attn,
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                self.steps_method[self.stepi],
+            )
+            torch.cuda.synchronize()
+        et = time()
+
+        return et - st

@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
 import copy
+from time import time
 
 
 class DiTFastAttnFFN(nn.Module):
@@ -33,5 +34,13 @@ class DiTFastAttnFFN(nn.Module):
         else:
             out = self.raw_module(hidden_states)
         if self.need_cache_output:
-            self.cache_output = out
+            self.cache_output = out.detach()
         return out
+    
+    def get_latency(self, hidden_states, iter = 100):
+        st = time()
+        for i in range(iter):
+            self.forward(hidden_states)
+            torch.cuda.synchronize()
+        et = time()
+        return et - st

@@ -142,6 +142,7 @@ def get_layer_influence(pipe, dataloader, dfa_config, model_misc):
             m.processor.cached_output1 = output
             m.processor.cached_input = input
             m.processor.cached_kwargs = kwargs
+        
 
     def collect_influence_backward_hook(m, grad_input, grad_output):
         if m.timestep_index != 0:
@@ -226,94 +227,15 @@ def get_layer_influence(pipe, dataloader, dfa_config, model_misc):
     return layer_compression_influences
 
 def update_layer_influence_new(pipe, dataloader, dfa_config, model_misc, alpha=1e-8):
-    # set a dict to store compression influences for each method at each layer 
-    layer_compression_influences = {}
-
-    def collect_in_out_forward_hook(m, input, kwargs, output):
-        if isinstance(m, DiTFastAttnFFN):
-            m.cache_current_output = output
-            m.cache_input = input
-            m.cache_kwargs = kwargs
-        elif isinstance(m, model_misc.attn_class):
-            m.processor.cached_current_output = output
-            m.processor.cached_input = input
-            m.processor.cached_kwargs = kwargs
-
-    def collect_influence_backward_hook(m, grad_input, grad_output):
-        if m.timestep_index != 0:
-            if not hasattr(m,"compression_influences"):
-                m.compression_influences = {}
-            candidates = dfa_config.get_available_candidates(m.name)
-            if isinstance(m, DiTFastAttnFFN):
-                output = m.cache_current_output
-                input = m.cache_input
-                kwargs = m.cache_kwargs
-            elif isinstance(m, model_misc.attn_class):
-                output = m.processor.cached_current_output
-                input = m.processor.cached_input
-                kwargs = m.processor.cached_kwargs
-            for candidate in candidates:
-                dfa_config.set_layer_step_method(m.name, m.timestep_index, candidate)
-                with torch.no_grad():
-                    new_output = m.forward(*input, **kwargs).float()
-                # breakpoint()
-                influence = ((new_output - output.float()) * grad_output[0]).pow(2).sum()
-                if m.name not in layer_compression_influences:
-                    layer_compression_influences[m.name] = {}
-                if candidate not in layer_compression_influences[m.name]:
-                    layer_compression_influences[m.name][candidate] = 0
-                layer_compression_influences[m.name][candidate] += influence
-                if candidate not in m.compression_influences:
-                    m.compression_influences[candidate] = 0
-                m.compression_influences[candidate] += influence
-                # print(f"m name {m.name}, candidate {candidate}, influence: {influence}")
-                dfa_config.set_layer_step_method(m.name, m.timestep_index, "raw")
-        
-            
-    all_hooks = []
-    for name, module in pipe.transformer.named_modules():
-        module.name = name
-        if isinstance(module, model_misc.block_class):
-            # for DiT
-            if isinstance(module.attn1, model_misc.attn_class):
-                module.attn1.processor.compression_influences = {}
-                hook = module.attn1.register_forward_hook(collect_in_out_forward_hook, with_kwargs=True)
-                all_hooks.append(hook)
-                hook = module.attn1.register_full_backward_hook(collect_influence_backward_hook)
-                all_hooks.append(hook)
-                module.attn1.processor.need_cache_output = False
-            if isinstance(module.ff, DiTFastAttnFFN):
-                module.ff.compression_influences = {}
-                hook = module.ff.register_forward_hook(collect_in_out_forward_hook, with_kwargs=True)
-                all_hooks.append(hook)
-                hook = module.ff.register_full_backward_hook(collect_influence_backward_hook)
-                all_hooks.append(hook)
-                module.ff.need_cache_output = False
     for i, (args, kwargs) in enumerate(dataloader()):
         print(f">>> calibration fisher info sample {i} <<<")
         # model_misc.inference_fn_with_backward_plan_update(pipe, dfa_config, alpha, *args, **kwargs)
         model_misc.inference_fn_with_backward_plan_update_binary(pipe, dfa_config, alpha, *args, **kwargs)
-
-    # remove hooks
-    for hook in all_hooks:
-        hook.remove()
-
-    for name, module in pipe.transformer.named_modules():
-        module.name = name
-        if isinstance(module, model_misc.block_class):
-            # for DiT
-            if isinstance(module.attn1, model_misc.attn_class):
-                module.attn1.processor.need_cache_output = True
-                if hasattr(module.attn1.processor, "cached_input"):
-                    del module.attn1.processor.cached_input
-                if hasattr(module.attn1.processor, "cached_kwargs"):
-                    del module.attn1.processor.cached_kwargs
-
-            if isinstance(module.ff, DiTFastAttnFFN):
-                module.ff.need_cache_output = True
-                if hasattr(module.ff, "cache_input"):
-                    del module.ff.cache_input
-                if hasattr(module.ff, "cache_kwargs"):
-                    del module.ff.cache_kwargs
-
+        # model_misc.inference_fn_with_backward_metric_check(pipe, dfa_config, alpha, *args, **kwargs)
     return
+
+def update_layer_influence_two_phase(pipe, dataloader, dfa_config, model_misc, alpha):
+    for i, (args, kwargs) in enumerate(dataloader()):
+        print(f">>> calibration fisher info sample {i} <<<")
+        # breakpoint()
+        model_misc.inference_fn_with_backward_plan_update_binary_iop(pipe, dfa_config, alpha, *args, **kwargs)
