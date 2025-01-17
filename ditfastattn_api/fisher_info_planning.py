@@ -238,4 +238,4 @@ def update_layer_influence_two_phase(pipe, dataloader, dfa_config, model_misc, a
     for i, (args, kwargs) in enumerate(dataloader()):
         print(f">>> calibration fisher info sample {i} <<<")
         # breakpoint()
-        model_misc.inference_fn_with_backward_plan_update_binary_iop(pipe, dfa_config, alpha, *args, **kwargs)
+        model_misc.inference_fn_with_backward_plan_update_binary_new_method(pipe, dfa_config, alpha, *args, **kwargs)

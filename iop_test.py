@@ -70,7 +70,6 @@ def solve_ip(influence_dict, latency_dict, alpha):
             layer_set.add(current_layer)
             
             setattr(model, name, layer_method_dict[name]['var'])
-
         # set constraint 
         set_constraint(model, layer_set, layer_method_dict, alpha)
 
@@ -90,7 +89,7 @@ def solve_ip(influence_dict, latency_dict, alpha):
             print(f"{name}: {layer_method_dict[name]['var']()}")
             if layer_method_dict[name]['var']() == 1:
                 res.append((layer_method_dict[name]['full_name'], layer_method_dict[name]['method']))
-        breakpoint()
+    # breakpoint()
     return res
 
 

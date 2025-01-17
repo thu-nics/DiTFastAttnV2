@@ -374,7 +374,7 @@ class MMDiTFastAttnProcessor:
                     if self.block_mask is None:
                         print(f"Compile window attention kernel 1")
                         sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // 8, vtok_len=S - 333)
-                        block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+                        block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=256)
                         self.block_mask = block_mask
                     w_hidden_states = self.window_func(
                         query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
@@ -706,7 +706,7 @@ class MMDiTFastAttnProcessor:
             self.steps_method[self.stepi],
             )
         else:
-            hidden_states = self.run_forward_method(
+            hidden_states, encoder_hidden_states = self.run_forward_method(
                 attn,
                 hidden_states,
                 encoder_hidden_states,
@@ -714,7 +714,7 @@ class MMDiTFastAttnProcessor:
                 self.steps_method[self.stepi],
             )
         # After been call once, add the timestep index of this attention module by 1
-        return hidden_states
+        return hidden_states, encoder_hidden_states
 
 
     def get_latency(self,

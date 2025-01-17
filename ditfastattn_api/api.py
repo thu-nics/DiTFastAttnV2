@@ -4,7 +4,11 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward, BasicTransformerBlock, JointTransformerBlock
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from ditfastattn_api.modules.dfa_ffn import DiTFastAttnFFN
-from ditfastattn_api.modules.dfa_processor import DiTFastAttnProcessor, MMDiTFastAttnProcessor
+# from ditfastattn_api.modules.dfa_processor import DiTFastAttnProcessor, MMDiTFastAttnProcessor
+# --------
+from ditfastattn_api.modules.dfa_processor import DiTFastAttnProcessor
+from ditfastattn_api.modules.dfa_processor_revised import MMDiTFastAttnProcessor
+# --------
 from ditfastattn_api.dfa_config import DiTFastAttnConfig
 import time
 import numpy as np

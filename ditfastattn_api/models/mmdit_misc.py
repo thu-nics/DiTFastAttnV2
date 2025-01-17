@@ -39,6 +39,18 @@ block_class = JointTransformerBlock
 attn_class = Attention
 ffn_class = FeedForward
 
+def debug_memory():
+    import collections, gc, resource, torch
+    print('maxrss = {}'.format(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
+    tensors = collections.Counter(
+        (str(o.device), str(o.dtype), tuple(o.shape))
+        for o in gc.get_objects()
+        if torch.is_tensor(o)
+    )
+    for line in sorted(tensors.items()):
+        print('{}\t{}'.format(*line))
+
 # Copied from diffusers.pipelines.flux.pipeline_flux.calculate_shift
 def calculate_shift(
     image_seq_len,
@@ -2000,25 +2012,26 @@ def inference_fn_with_backward_plan_update_binary_new_method(
                 # print(f"m name {m.name}, candidate {candidate}, influence: {influence}")
                 dfa_config.set_layer_step_method(m.name, m.timestep_index, "raw")
 
+    # load latency_dict
+    latency_dict = torch.load("cache/latency_dict.json")
+
     # 7. Denoising loop
     with pipe.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
             # set hook, set need_cache_output to false
             all_hooks = []
+            print(f"-------------------step {i}--------------------")
+
             for name, module in pipe.transformer.named_modules():
                 module.name = name
                 if isinstance(module, block_class):
                     # for MMDiT
                     if isinstance(module.attn, attn_class):
-                        module.attn.compression_influences = {}
+                        module.attn.processor.compression_influences = {}
+                    #     module.attn.processor.dfa_config = dfa_config
+                        module.attn.processor.forward_mode = "calib_get_grad"
                         module.attn.processor.dfa_config = dfa_config
-                        module.attn.processor.calib_mode = "get_grad"
-                    #     hook = module.attn.register_forward_hook(collect_in_out_forward_hook, with_kwargs=True)
-                    #     all_hooks.append(hook)
-                    #     hook = module.attn.register_full_backward_hook(collect_influence_backward_hook)
-                    #     all_hooks.append(hook)
-                        module.attn.processor.need_cache_output = False
-                    #     module.attn.processor.cache_residual_forced = False
+                    #     module.attn.processor.need_cache_output = False
                     if isinstance(module.ff, DiTFastAttnFFN):
                         module.ff.compression_influences = {}
                         hook = module.ff.register_forward_hook(collect_in_out_forward_hook, with_kwargs=True)
@@ -2026,10 +2039,10 @@ def inference_fn_with_backward_plan_update_binary_new_method(
                         hook = module.ff.register_full_backward_hook(collect_influence_backward_hook)
                         all_hooks.append(hook)
                         module.ff.need_cache_output = False
-
+            
             if pipe.interrupt:
                 continue
-
+            
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if pipe.do_classifier_free_guidance else latents
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
@@ -2041,7 +2054,6 @@ def inference_fn_with_backward_plan_update_binary_new_method(
                     module.stepi = i
                 if isinstance(module, attn_class):
                     module.processor.stepi = i
-
             noise_pred = pipe.transformer(
                 hidden_states=latent_model_input.detach(),
                 timestep=timestep,
@@ -2065,7 +2077,7 @@ def inference_fn_with_backward_plan_update_binary_new_method(
                     timestep = t.expand(latents.shape[0])
                     latent_model_input = latents
                     noise_pred_skip_layers = pipe.transformer(
-                        hidden_states=latent_model_input,
+                        hidden_states=latent_model_input.detach(),
                         timestep=timestep.detach(),
                         encoder_hidden_states=original_prompt_embeds.detach(),
                         pooled_projections=original_pooled_prompt_embeds.detach(),
@@ -2079,42 +2091,16 @@ def inference_fn_with_backward_plan_update_binary_new_method(
 
             _latents = pipe.scheduler.step(noise_pred, t.detach(), latents.detach(), return_dict=False)[0]
             # compute fisher info and retain graph for later use
-            # breakpoint()
             _latents.mean().backward()
+
             # keep the step unchanged
             pipe.scheduler._step_index -= 1
             pipe.transformer.zero_grad()
             pipe.text_encoder.zero_grad()
             pipe.text_encoder_2.zero_grad()
             pipe.text_encoder_3.zero_grad()
+            # torch.cuda.empty_cache()
 
-            # remove hooks
-            for hook in all_hooks:
-                hook.remove()
-
-            # remove all cached input and kwargs
-            for name, module in pipe.transformer.named_modules():
-                module.name = name
-                if isinstance(module, block_class):
-                    # for MMDiT
-                    if isinstance(module.attn, attn_class):
-                        module.attn.processor.dfa_config = None
-                        module.attn.processor.calib_mode = "off"
-                    #     if hasattr(module.attn.processor, "cached_input"):
-                    #         del module.attn.processor.cached_input
-                    #     if hasattr(module.attn.processor, "cached_kwargs"):
-                    #         del module.attn.processor.cached_kwargs
-                    #     if hasattr(module.attn.processor, "cached_current_output"):
-                    #         del module.attn.processor.cached_current_output
-
-                    if isinstance(module.ff, DiTFastAttnFFN):
-                        if hasattr(module.ff, "cache_input"):
-                            del module.ff.cache_input
-                        if hasattr(module.ff, "cache_kwargs"):
-                            del module.ff.cache_kwargs
-                        if hasattr(module.ff, "cache_current_output"):
-                            del module.ff.cache_current_output
-            
             # set dfa config after each timestep
             if i != 0:
                 # print(dfa_config)
@@ -2127,7 +2113,7 @@ def inference_fn_with_backward_plan_update_binary_new_method(
                         if isinstance(module.attn, attn_class):
                             if module.attn.name not in influences:
                                 influences[module.attn.name] = {}
-                            for candidate, cached_influence in module.attn.compression_influences.items():
+                            for candidate, cached_influence in module.attn.processor.compression_influences.items():
                                 if candidate not in influences[module.attn.name]:
                                     influences[module.attn.name][candidate] = 0
                                 influences[module.attn.name][candidate] += cached_influence
@@ -2151,161 +2137,82 @@ def inference_fn_with_backward_plan_update_binary_new_method(
                 # print(sorted_layer_compression_influences)
                 torch.save(sorted_layer_compression_influences, "cache/influence.json")
 
-                # conduct binary search
-                l_idx = 0
-                r_idx = len(sorted_layer_compression_influences)
-                m_idx = (r_idx - l_idx) // 2
-                tol = 1e-3
-                l = 1
-                # breakpoint()
-                while r_idx - l_idx >= 2:
-                    # choose compression method that achieve highest compression ratio
-                    # print(dfa_config)
-                    # reset method of all layers to raw
-                    with torch.no_grad():
-                        dfa_config.reset_step_method(i, None)
-                        for j in range(m_idx):
-                            dfa_config.set_layer_step_method(sorted_layer_compression_influences[j][0], i, sorted_layer_compression_influences[j][1])
-
-                        temp_noise_pred = pipe.transformer(
-                            hidden_states=latent_model_input.detach(),
-                            timestep=timestep.detach(),
-                            encoder_hidden_states=prompt_embeds.detach(),
-                            pooled_projections=pooled_prompt_embeds.detach(),
-                            joint_attention_kwargs=pipe.joint_attention_kwargs,
-                            return_dict=False,
-                        )[0]
-                        # perform guidance
-                        if pipe.do_classifier_free_guidance:
-                            temp_noise_pred_uncond, temp_noise_pred_text = temp_noise_pred.chunk(2)
-                            temp_noise_pred = temp_noise_pred_uncond + pipe.guidance_scale * (temp_noise_pred_text - temp_noise_pred_uncond)
-                            should_skip_layers = (
-                                True
-                                if i > num_inference_steps * skip_layer_guidance_start
-                                and i < num_inference_steps * skip_layer_guidance_stop
-                                else False
-                            )
-                            if skip_guidance_layers is not None and should_skip_layers:
-                                timestep = t.expand(latents.shape[0])
-                                latent_model_input = latents
-                                temp_noise_pred_skip_layers = pipe.transformer(
-                                    hidden_states=latent_model_input,
-                                    timestep=timestep,
-                                    encoder_hidden_states=original_prompt_embeds.detach(),
-                                    pooled_projections=original_pooled_prompt_embeds.detach(),
-                                    joint_attention_kwargs=pipe.joint_attention_kwargs,
-                                    return_dict=False,
-                                    skip_layers=skip_guidance_layers,
-                                )[0]
-                                temp_noise_pred = (
-                                    temp_noise_pred + (temp_noise_pred_text - temp_noise_pred_skip_layers) * pipe._skip_layer_guidance_scale
-                                )
-
-                        # compute the previous noisy sample x_t -> x_t-1
-                        # latents_dtype = latents.dtype
-                        temp_latents = pipe.scheduler.step(temp_noise_pred, t.detach(), latents.detach(), return_dict=False)[0]
-                        pipe.scheduler._step_index -= 1
-      
-                    diff = (_latents - temp_latents) / (torch.max(_latents, temp_latents) + 1e-6)
-                    # print(f"diff {diff}")
-                    l = diff.abs().clip(0,10).mean()
-                    # add up influence
-                    influence = 0
-                    for name, module in pipe.transformer.named_modules():
-                        module.name = name
-                        if isinstance(module, block_class):
-                            # for MMDiT
-                            if isinstance(module.attn, attn_class):
-                                current_method = dfa_config.layers[module.attn.name]["kwargs"]['steps_method'][i]
-                                if current_method != "raw":
-                                    influence = influence + influences[module.attn.name][current_method]
-                            if isinstance(module.ff, DiTFastAttnFFN):
-                                current_method = dfa_config.layers[module.ff.name]["kwargs"]['steps_method'][i]
-                                if current_method != "raw":
-                                    influence = influence + influences[module.ff.name][current_method]
-                    print(f"l idx {l_idx}, m idx {m_idx}, r idx {r_idx}, l {l:,.3f}, influence ratio {(influence / latent_model_input.mean().pow(2))}, alpha {alpha:,.3f}")
-                    if l <= alpha:
-                        l_idx = m_idx
-                    elif l > alpha:
-                        r_idx = m_idx
-                    m_idx = (r_idx + l_idx) // 2
-
-                    if abs(l - alpha) < tol:
-                        break
-
-                if l_idx == 0:
-                    dfa_config.reset_step_method(i, None)
+                method_list = solve_ip(sorted_layer_compression_influences, latency_dict, alpha)
+                for layer_name, method in method_list:
+                    dfa_config.set_layer_step_method(layer_name, i, method)
 
             for name, module in pipe.transformer.named_modules():
                 module.name = name
                 if isinstance(module, block_class):
                     # for DiT
                     if isinstance(module.attn, attn_class):
-                        module.attn.processor.need_cache_output = True
-                        module.attn.processor.cached_residual = None
-                        module.attn.processor.calib_mode = "cache_hidden_states"
-                        if module.attn.processor.steps_method[i] == "raw":
-                            module.attn.processor.cache_residual_forced = True
+                        # module.attn.processor.need_cache_output = True
+                        # module.attn.processor.cached_residual = None
+                        module.attn.processor.forward_mode = "calib_post_inference"
+                        module.attn.processor.dfa_config = None
+                        # if module.attn.processor.steps_method[i] == "raw":
+                        #     module.attn.processor.cache_residual_forced = True
                     if isinstance(module.ff, DiTFastAttnFFN):
                         module.ff.need_cache_output = True
             print(dfa_config)
 
-
-            noise_pred = pipe.transformer(
-                hidden_states=latent_model_input.detach(),
-                timestep=timestep.detach(),
-                encoder_hidden_states=prompt_embeds.detach(),
-                pooled_projections=pooled_prompt_embeds.detach(),
-                joint_attention_kwargs=pipe.joint_attention_kwargs,
-                return_dict=False,
-            )[0]
-            # perform guidance
-            if pipe.do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + pipe.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                should_skip_layers = (
-                    True
-                    if i > num_inference_steps * skip_layer_guidance_start
-                    and i < num_inference_steps * skip_layer_guidance_stop
-                    else False
-                )
-                if skip_guidance_layers is not None and should_skip_layers:
-                    timestep = t.expand(latents.shape[0])
-                    latent_model_input = latents
-                    noise_pred_skip_layers = pipe.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=original_prompt_embeds.detach(),
-                        pooled_projections=original_pooled_prompt_embeds.detach(),
-                        joint_attention_kwargs=pipe.joint_attention_kwargs,
-                        return_dict=False,
-                        skip_layers=skip_guidance_layers,
-                    )[0]
-                    noise_pred = (
-                        noise_pred + (noise_pred_text - noise_pred_skip_layers) * pipe._skip_layer_guidance_scale
+            with torch.no_grad():
+                noise_pred = pipe.transformer(
+                    hidden_states=latent_model_input.detach(),
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds.detach(),
+                    pooled_projections=pooled_prompt_embeds.detach(),
+                    joint_attention_kwargs=pipe.joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
+                # perform guidance
+                if pipe.do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + pipe.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    should_skip_layers = (
+                        True
+                        if i > num_inference_steps * skip_layer_guidance_start
+                        and i < num_inference_steps * skip_layer_guidance_stop
+                        else False
                     )
+                    if skip_guidance_layers is not None and should_skip_layers:
+                        timestep = t.expand(latents.shape[0])
+                        latent_model_input = latents
+                        noise_pred_skip_layers = pipe.transformer(
+                            hidden_states=latent_model_input.detach(),
+                            timestep=timestep,
+                            encoder_hidden_states=original_prompt_embeds.detach(),
+                            pooled_projections=original_pooled_prompt_embeds.detach(),
+                            joint_attention_kwargs=pipe.joint_attention_kwargs,
+                            return_dict=False,
+                            skip_layers=skip_guidance_layers,
+                        )[0]
+                        noise_pred = (
+                            noise_pred + (noise_pred_text - noise_pred_skip_layers) * pipe._skip_layer_guidance_scale
+                        )
 
-            # compute the previous noisy sample x_t -> x_t-1
-            # latents_dtype = latents.dtype
-            latents = pipe.scheduler.step(noise_pred, t.detach(), latents.detach(), return_dict=False)[0]
-            # breakpoint()
+                # compute the previous noisy sample x_t -> x_t-1
+                # latents_dtype = latents.dtype
+                latents = pipe.scheduler.step(noise_pred, t.detach(), latents.detach(), return_dict=False)[0]
 
             torch.cuda.empty_cache()
+
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % pipe.scheduler.order == 0):
                 progress_bar.update()
+
 
     for name, module in pipe.transformer.named_modules():
         module.name = name
         if isinstance(module, block_class):
             # for MMDiT
             if isinstance(module.attn, attn_class):
-            #     module.attn.compression_influences = {}
-            #     module.attn.processor.cached_output = None
-            #     module.attn.processor.cached_residual = None
-                module.attn.processor.cache_residual_forced = False
+                module.attn.compression_influences = {}
+                module.attn.processor.cached_output = None
+                module.attn.processor.cached_residual = None
+            #     module.attn.processor.cache_residual_forced = False
                 module.attn.processor.dfa_config=None
-                module.attn.processor.calib_mode = "off"
+                module.attn.processor.forward_mode = "normal"
             if isinstance(module.ff, DiTFastAttnFFN):
                 module.ff.compression_influences = {}
                 module.ff.cache_output = None

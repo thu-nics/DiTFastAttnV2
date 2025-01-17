@@ -25,8 +25,8 @@ model_misc = mmdit_misc
 # model_id = "./models/stable-diffusion-3-medium-diffusers/"
 model_id = "stabilityai/stable-diffusion-3-medium-diffusers"
 seed = 3
-n_steps = 20
-resolution = 1024
+n_steps = 28
+resolution = 512
 calib_x = torch.randint(0, 1000, (6,), generator=torch.Generator().manual_seed(seed)).to("cuda")
 pipe = StableDiffusion3Pipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
 pipe = pipe.to("cuda")
@@ -87,18 +87,18 @@ def dataloader():
 # pipe.transformer.to(torch.float16)
 
 dfa_config = transform_model_dfa(pipe.transformer, n_steps=n_steps, window_func=flex_attn_block_mask_compiled)
-ms = MethodSpeedup()
-ms.load_candidates(dfa_config.get_available_candidates(dfa_config.layer_names[0]))
-latency_dict = ms.generate_latency('test', pipe, n_steps, dfa_config, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
-print(latency_dict)
-torch.save(latency_dict, "cache/latency_dict.json")
-latency = dfa_test_latency(pipe, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
+# ms = MethodSpeedup()
+# ms.load_candidates(dfa_config.get_available_candidates(dfa_config.layer_names[0]))
+# latency_dict = ms.generate_latency('test', pipe, n_steps, dfa_config, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
+# print(latency_dict)
+# torch.save(latency_dict, "cache/latency_dict.json")
+# latency = dfa_test_latency(pipe, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
 # breakpoint()
 
 # width 9 subplots
 fig, axs = plt.subplots(1, 9, figsize=(20, 15))  # figsize width=20
 
-for i, threshold in enumerate(np.linspace(0, 0.0009, 9)):
+for i, threshold in enumerate(np.linspace(0, 0.0005, 3)):
 # for i, threshold in enumerate([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.15, 0.175, 0.2]):
     # add
     # pipe = DiTPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
@@ -122,6 +122,7 @@ for i, threshold in enumerate(np.linspace(0, 0.0009, 9)):
     unregister_refresh_stepi_hook(pipe.transformer)
     register_refresh_stepi_hook(pipe.transformer, n_steps)
     # breakpoint()
+    print("-------end calibration--------")
     latency = dfa_test_latency(pipe, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
     # generate a image
     generator = torch.Generator().manual_seed(seed)
