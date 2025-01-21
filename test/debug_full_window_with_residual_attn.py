@@ -4,12 +4,14 @@ import torch
 import torch.nn.functional as F
 from ditfastattn_api.full_window_attn_with_window_residual import full_mm_attn_with_window_residual
 
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
     
 def debug_blockwise_window_attn_with_text():
     bs=1
     nhead=1
     query_len=kv_len=32
-    txt_len=20
+    txt_len=16
     total_len=query_len+txt_len
     block_size=16
     head_dim=256
@@ -28,9 +30,9 @@ def debug_blockwise_window_attn_with_text():
     
 def accuracy_blockwise_window_attn_with_text():
     bs=1
-    nhead=2
+    nhead=1
     query_len=kv_len=32
-    txt_len=16
+    txt_len=3
     total_len=query_len+txt_len
     block_size=16
     head_dim=16
@@ -50,12 +52,13 @@ def accuracy_blockwise_window_attn_with_text():
     attention_mask[:16,:16]=True
     attention_mask[:16,-txt_len:]=True
     attention_mask[16:,:]=True
-    # print(attention_mask[::8,::8])
+    print(attention_mask[::8,::8])
     
     o,residual=full_mm_attn_with_window_residual(q,k,v,query_len,txt_len,left_window_size,right_window_size,block_size)
     window_o=o-residual
     raw_o=F.scaled_dot_product_attention(q,k,v,attn_mask=attention_mask)
     print((window_o-raw_o)[:,:,:,0])
+    # print(residual[:,:,:,0])
     print(window_o[:,:,:,0])
     print(raw_o[:,:,:,0])
 

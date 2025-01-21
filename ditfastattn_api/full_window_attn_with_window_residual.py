@@ -15,7 +15,7 @@ import pdb
 
 
 configs = [triton.Config({}, num_stages=s, num_warps=w) 
-    for s in [1,2,3]
+    for s in [1]
     for w in [4,8,16]
 ]
 # NOTE: if use num_stages>3, the precision will has problem
@@ -115,7 +115,7 @@ def _headwise_full_attn_window_residual_fwd_inner(
     window_start_ind = tl.maximum((-left_window_size)//BLOCK_M +cur_block_row_id,0)*BLOCK_M
     window_end_ind=tl.minimum(right_window_size//BLOCK_M+cur_block_row_id, vis_token_len//BLOCK_M)*BLOCK_M
     
-    # if tl.program_id(0)==0 and tl.program_id(1)==0:
+    # if tl.program_id(0)==1 and tl.program_id(1)==0:
     #     tl.device_print("col_ind window_start, window_end",window_start_ind*1000+window_end_ind)
     
     for col_ind in tl.range(0, vis_token_len+txt_token_len, BLOCK_N):
@@ -146,24 +146,37 @@ def _headwise_full_attn_window_residual_fwd_inner(
             p = p.to(tl.float8e5)
         else:
             p = p.to(V_block_ptr.dtype.element_ty)
+        # if tl.program_id(0)==0 and tl.program_id(1)==0:
+        #     tl.device_print("p",tl.max(p))
+        #     tl.device_print("v",tl.max(v))
+        #     tl.device_print("acc",tl.max(acc))
         acc = tl.dot(p, v, acc)
         # -- update m_i and l_i
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
         
-        if col_ind >= window_start_ind and col_ind < window_end_ind:
+        if (col_ind >= window_start_ind and col_ind < window_end_ind) or col_ind//BLOCK_N>=vis_token_len//BLOCK_N:
             # if tl.program_id(0)==0 and tl.program_id(1)==0:
-            #     tl.device_print("win_acc and col_ind",tl.max(win_acc)+col_ind*1000)
+            #     tl.device_print("col_ind",col_ind)
             win_m_i_new = tl.maximum(win_m_i, tl.max(qk, 1))
             win_alpha=tl.math.exp2(win_m_i-win_m_i_new)
             win_p=tl.math.exp2(qk-win_m_i_new[:,None])
-            win_p = win_p.to(V_block_ptr.dtype.element_ty)
             win_acc*=win_alpha[:,None]
+            
+            win_p = win_p.to(V_block_ptr.dtype.element_ty)
+            # if tl.program_id(0)==0 and tl.program_id(1)==0:
+            #     tl.device_print("win_p",win_p)
+            #     tl.device_print("v",v)
+                # tl.device_print("win_acc",tl.max(win_acc))
             win_acc=tl.dot(win_p,v,win_acc)
+            # if tl.program_id(0)==0 and tl.program_id(1)==0:
+            #     # tl.device_print("win_p",tl.max(win_p))
+            #     # tl.device_print("v",tl.max(v))
+            #     tl.device_print("after_win_acc",win_acc3)
             win_l_i=win_l_i*win_alpha+tl.sum(win_p,1)
             win_m_i=win_m_i_new
-            # if tl.program_id(0)==0 and tl.program_id(1)==0:
-            #     tl.device_print("win_acc",tl.max(win_acc))
+            
+        #     tl.device_print("l_i",tl.max(l_i))
             
         
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
@@ -174,7 +187,7 @@ def _headwise_full_attn_window_residual_fwd_inner(
     
 
 
-# @triton.autotune(configs, key=["txt_token_len", "vis_token_len", "HEAD_DIM","BLOCK_M"])
+@triton.autotune(configs, key=["txt_token_len", "vis_token_len", "HEAD_DIM","BLOCK_M"])
 @triton.jit
 def _blockwise_full_mm_attn_with_window_residual_fwd(
     Q,
@@ -315,6 +328,10 @@ def _blockwise_full_mm_attn_with_window_residual_fwd(
         l_i = tl.where(l_i == 0.0, 1, l_i)
         acc = acc / l_i[:, None]
         win_l_i = tl.where(win_l_i == 0.0, 1, win_l_i)
+        # if tl.program_id(0)==0 and tl.program_id(1)==0:
+        #     tl.device_print("win_l_i",tl.max(win_l_i))
+        # if tl.program_id(0)==0 and tl.program_id(1)==0:
+        #     tl.device_print("l_i",tl.max(l_i))
         reisudal_acc = acc-(win_acc / win_l_i[:, None])
         tl.store(O_block_ptr, acc.to(Out.type.element_ty))
         tl.store(Residual_block_ptr, reisudal_acc.to(Out.type.element_ty))
