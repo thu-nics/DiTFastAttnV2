@@ -46,6 +46,12 @@ class MMDiTFastAttnProcessor:
         self.dfa_config=None
         self.stepi=0
         
+        # self.attn_weight=0
+        # self.attn_weight_num_count=0
+        window_size_candidates = [0.5,0.4,0.3,0.2,0.1]
+        self.relative_MSE_threshold=0.01 # hyperparameter
+        self.evaluated_latency=None
+        
     def update_config(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, copy.deepcopy(value))
@@ -142,33 +148,33 @@ class MMDiTFastAttnProcessor:
             self.cached_output = hidden_states.detach(), encoder_hidden_states.detach()
         
         return hidden_states, encoder_hidden_states
+    
+    def calib_collect_info_qkv_process_func(self, query, key, value, forward_args):
+        # witout residual share window attention
+        pass
+    
+    def calib_qkv_process_func(self, query, key, value, forward_args):
+        # window_size_candidates = [0.995,0.99,0.98,0.97,0.96,0.95]
+        headwise_relative_MSE={} # key (head, method) value: relative MSE = 均方误差（MSE）与目标变量方差的比值 （maybe）
+        latency_delta={}
+        # without residual share
+        
+        # with residual share (latency *1.5)
+        
+        # output share
+        
+        # ILP: target is to minimize the latency given MSE is below a threshold (?)
+        
+        # per head, gen kernel
 
-    def get_grad_qkv_process_func(self, query, key, value, forward_args):
+    def get_attn_weight_qkv_process_func(self, query, key, value, forward_args):
         # breakpoint()
+        score=torch.matmul(query, key.transpose(-1, -2))
+        p=F.softmax(score, dim=-1) # b,head,seq,seq
+        self.attn_weight+=p.mean(0).detach()
+        self.attn_weight_num_count+=1
+        
         hidden_states = flash_attn.flash_attn_func(query, key, value)
-        attn=forward_args["attn"]
-        handles=[]
-        
-        def get_influence_hook(grad):
-            # breakpoint()
-            candidates = self.dfa_config.get_available_candidates(attn.name)
-            for candidate in candidates:
-                if candidate == 'output_share':
-                    influence = ((self.prev_calib_output.float() - hidden_states.float()) * grad[0]).sum().abs().cpu()
-                elif 'window_attn' in candidate:
-                    hidden_states_with_wars= self.window_attn_qkv_process_func(query, key, value, forward_args)
-                    influence = ((hidden_states_with_wars.float() - hidden_states.float()) * grad[0]).sum().abs().cpu()
-                    del hidden_states_with_wars
-                if candidate not in self.compression_influences:
-                    self.compression_influences[candidate] = 0
-                self.compression_influences[candidate] += influence.detach()
-            print("layer name", attn.name, "compression_influences", self.compression_influences)
-            handles[0].remove()
-            
-        handle=hidden_states.register_hook(get_influence_hook)
-        handles.append(handle)
-        
-        # breakpoint()
         return hidden_states
     
     def raw_qkv_process_func(self, query, key, value, forward_args):
@@ -215,29 +221,18 @@ class MMDiTFastAttnProcessor:
         *args,
         **kwargs,
     ) -> torch.FloatTensor:
-        if self.forward_mode == "calib_get_grad":
-            if self.stepi != 0:
-                qkv_process_func=self.get_grad_qkv_process_func
-            else:
-                qkv_process_func=self.raw_residual_cache_qkv_process_func
+        if self.forward_mode == "calib_collect_info":
+            qkv_process_func=self.calib_collect_info_qkv_process_func
             
         elif self.forward_mode == "calib_post_inference":
             # breakpoint()
-            if self.steps_method[self.stepi] == "raw":
-                qkv_process_func=  self.raw_residual_cache_qkv_process_func
-            elif self.steps_method[self.stepi] == "output_share":
-                return self.cached_output
-            elif "residual_window_attn" in self.steps_method[self.stepi]:
-                qkv_process_func=self.window_attn_qkv_process_func
-        
-        elif self.forward_mode == "debug_calib":
-            # breakpoint()
-            if self.steps_method[self.stepi] == "raw":
-                qkv_process_func=  self.raw_qkv_process_func
-            elif self.steps_method[self.stepi] == "output_share":
-                return self.cached_output
-            elif "residual_window_attn" in self.steps_method[self.stepi]:
-                qkv_process_func=self.window_attn_qkv_process_func
+            qkv_process_func=  self.calib_qkv_process_func
+            # if self.steps_method[self.stepi] == "raw":
+            #     qkv_process_func=  self.raw_residual_cache_qkv_process_func
+            # elif self.steps_method[self.stepi] == "output_share":
+            #     return self.cached_output
+            # elif "residual_window_attn" in self.steps_method[self.stepi]:
+            #     qkv_process_func=self.window_attn_qkv_process_func
         
         elif self.forward_mode == "normal":
             if self.steps_method[self.stepi] == "raw":

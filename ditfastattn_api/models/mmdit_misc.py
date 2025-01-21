@@ -2014,6 +2014,7 @@ def inference_fn_with_backward_plan_update_binary_new_method(
 
     # load latency_dict
     latency_dict = torch.load("cache/latency_dict.json")
+    ground_truth = torch.load("ground_truth.pth")
 
     # 7. Denoising loop
     with pipe.progress_bar(total=num_inference_steps) as progress_bar:
@@ -2092,6 +2093,8 @@ def inference_fn_with_backward_plan_update_binary_new_method(
             _latents = pipe.scheduler.step(noise_pred, t.detach(), latents.detach(), return_dict=False)[0]
             # compute fisher info and retain graph for later use
             _latents.mean().backward()
+            #loss = torch.mean(((_latents - ground_truth[i].cuda()) ** 2).reshape(_latents.shape[0], -1))
+            # loss.backward()
 
             # keep the step unchanged
             pipe.scheduler._step_index -= 1
@@ -2709,3 +2712,343 @@ def inference_fn_with_backward_plan_update_binary_iop(
                 module.ff.compression_influences = {}
                 module.ff.cache_output = None
     torch.cuda.empty_cache()
+
+def inference_save_ground_truth(
+    pipe: StableDiffusion3Pipeline,
+    prompt: Union[str, List[str]] = None,
+    prompt_2: Optional[Union[str, List[str]]] = None,
+    prompt_3: Optional[Union[str, List[str]]] = None,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+    num_inference_steps: int = 28,
+    sigmas: Optional[List[float]] = None,
+    guidance_scale: float = 7.0,
+    negative_prompt: Optional[Union[str, List[str]]] = None,
+    negative_prompt_2: Optional[Union[str, List[str]]] = None,
+    negative_prompt_3: Optional[Union[str, List[str]]] = None,
+    num_images_per_prompt: Optional[int] = 1,
+    generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    latents: Optional[torch.FloatTensor] = None,
+    prompt_embeds: Optional[torch.FloatTensor] = None,
+    negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+    pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+    negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+    ip_adapter_image: Optional[PipelineImageInput] = None,
+    ip_adapter_image_embeds: Optional[torch.Tensor] = None,
+    joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    clip_skip: Optional[int] = None,
+    callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    max_sequence_length: int = 256,
+    skip_guidance_layers: List[int] = None,
+    skip_layer_guidance_scale: float = 2.8,
+    skip_layer_guidance_stop: float = 0.2,
+    skip_layer_guidance_start: float = 0.01,
+    mu: Optional[float] = None,
+):
+    
+    num_inference_steps = num_inference_steps * 2
+    height = height or pipe.default_sample_size * pipe.vae_scale_factor
+    width = width or pipe.default_sample_size * pipe.vae_scale_factor
+
+    # 2. Define call parameters
+    if prompt is not None and isinstance(prompt, str):
+        batch_size = 1
+    elif prompt is not None and isinstance(prompt, list):
+        batch_size = len(prompt)
+    else:
+        batch_size = prompt_embeds.shape[0]
+
+    device = pipe._execution_device
+
+    lora_scale = (
+        pipe.joint_attention_kwargs.get("scale", None) if pipe.joint_attention_kwargs is not None else None
+    )
+    (
+        prompt_embeds,
+        negative_prompt_embeds,
+        pooled_prompt_embeds,
+        negative_pooled_prompt_embeds,
+    ) = pipe.encode_prompt(
+        prompt=prompt,
+        prompt_2=prompt_2,
+        prompt_3=prompt_3,
+        negative_prompt=negative_prompt,
+        negative_prompt_2=negative_prompt_2,
+        negative_prompt_3=negative_prompt_3,
+        do_classifier_free_guidance=pipe.do_classifier_free_guidance,
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+        device=device,
+        clip_skip=pipe.clip_skip,
+        num_images_per_prompt=num_images_per_prompt,
+        max_sequence_length=max_sequence_length,
+        lora_scale=lora_scale,
+    )
+
+    if pipe.do_classifier_free_guidance:
+        if skip_guidance_layers is not None:
+            original_prompt_embeds = prompt_embeds
+            original_pooled_prompt_embeds = pooled_prompt_embeds
+        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+
+    # 4. Prepare latent variables
+    num_channels_latents = pipe.transformer.config.in_channels
+    latents = pipe.prepare_latents(
+        batch_size * num_images_per_prompt,
+        num_channels_latents,
+        height,
+        width,
+        prompt_embeds.dtype,
+        device,
+        generator,
+        latents,
+    )
+
+    # 5. Prepare timesteps
+    scheduler_kwargs = {}
+    if pipe.scheduler.config.get("use_dynamic_shifting", None) and mu is None:
+        _, _, height, width = latents.shape
+        image_seq_len = (height // pipe.transformer.config.patch_size) * (
+            width // pipe.transformer.config.patch_size
+        )
+        mu = calculate_shift(
+            image_seq_len,
+            pipe.scheduler.config.base_image_seq_len,
+            pipe.scheduler.config.max_image_seq_len,
+            pipe.scheduler.config.base_shift,
+            pipe.scheduler.config.max_shift,
+        )
+        scheduler_kwargs["mu"] = mu
+    elif mu is not None:
+        scheduler_kwargs["mu"] = mu
+    timesteps, num_inference_steps = retrieve_timesteps(
+        pipe.scheduler,
+        num_inference_steps,
+        device,
+        sigmas=sigmas,
+        **scheduler_kwargs,
+    )
+    num_warmup_steps = max(len(timesteps) - num_inference_steps * pipe.scheduler.order, 0)
+    pipe._num_timesteps = len(timesteps)
+
+    # 6. Prepare image embeddings
+    if (ip_adapter_image is not None and pipe.is_ip_adapter_active) or ip_adapter_image_embeds is not None:
+        ip_adapter_image_embeds = pipe.prepare_ip_adapter_image_embeds(
+            ip_adapter_image,
+            ip_adapter_image_embeds,
+            device,
+            batch_size * num_images_per_prompt,
+            pipe.do_classifier_free_guidance,
+        )
+
+        if pipe.joint_attention_kwargs is None:
+            pipe._joint_attention_kwargs = {"ip_adapter_image_embeds": ip_adapter_image_embeds}
+        else:
+            pipe._joint_attention_kwargs.update(ip_adapter_image_embeds=ip_adapter_image_embeds)
+
+    # create a list to store ground truth
+    ground_truth_list = []
+
+    # 7. Denoising loop
+    with pipe.progress_bar(total=num_inference_steps) as progress_bar:
+        for i, t in enumerate(timesteps):
+            
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([latents] * 2) if pipe.do_classifier_free_guidance else latents
+            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            timestep = t.expand(latent_model_input.shape[0])
+
+            for name, module in pipe.transformer.named_modules():
+                module.timestep_index = i
+                if hasattr(module, "stepi"):
+                    module.stepi = i
+                if isinstance(module, attn_class):
+                    module.processor.stepi = i
+            noise_pred = pipe.transformer(
+                hidden_states=latent_model_input.detach(),
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds.detach(),
+                pooled_projections=pooled_prompt_embeds.detach(),
+                joint_attention_kwargs=pipe.joint_attention_kwargs,
+                return_dict=False,
+            )[0]
+
+            # perform guidance
+            if pipe.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + pipe.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                should_skip_layers = (
+                    True
+                    if i > num_inference_steps * skip_layer_guidance_start
+                    and i < num_inference_steps * skip_layer_guidance_stop
+                    else False
+                )
+                if skip_guidance_layers is not None and should_skip_layers:
+                    timestep = t.expand(latents.shape[0])
+                    latent_model_input = latents
+                    noise_pred_skip_layers = pipe.transformer(
+                        hidden_states=latent_model_input.detach(),
+                        timestep=timestep.detach(),
+                        encoder_hidden_states=original_prompt_embeds.detach(),
+                        pooled_projections=original_pooled_prompt_embeds.detach(),
+                        joint_attention_kwargs=pipe.joint_attention_kwargs,
+                        return_dict=False,
+                        skip_layers=skip_guidance_layers,
+                    )[0]
+                    noise_pred = (
+                        noise_pred + (noise_pred_text - noise_pred_skip_layers) * pipe._skip_layer_guidance_scale
+                    )
+
+            latents = pipe.scheduler.step(noise_pred, t.detach(), latents.detach(), return_dict=False)[0]
+            if i % 2 == 1:
+                ground_truth_list.append(latents.detach().cpu())
+            # ground_truth_list.append(latents.detach().cpu())
+            torch.cuda.empty_cache()
+
+            # call the callback, if provided
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % pipe.scheduler.order == 0):
+                progress_bar.update()
+    torch.save(ground_truth_list, f"ground_truth.pth")
+    
+    
+def inference_prompt_prepare_latent(
+    pipe: StableDiffusion3Pipeline,
+    prompt: Union[str, List[str]] = None,
+    prompt_2: Optional[Union[str, List[str]]] = None,
+    prompt_3: Optional[Union[str, List[str]]] = None,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+    num_inference_steps: int = 28,
+    sigmas: Optional[List[float]] = None,
+    guidance_scale: float = 7.0,
+    negative_prompt: Optional[Union[str, List[str]]] = None,
+    negative_prompt_2: Optional[Union[str, List[str]]] = None,
+    negative_prompt_3: Optional[Union[str, List[str]]] = None,
+    num_images_per_prompt: Optional[int] = 1,
+    generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    latents: Optional[torch.FloatTensor] = None,
+    prompt_embeds: Optional[torch.FloatTensor] = None,
+    negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+    pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+    negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+    ip_adapter_image: Optional[PipelineImageInput] = None,
+    ip_adapter_image_embeds: Optional[torch.Tensor] = None,
+    joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    clip_skip: Optional[int] = None,
+    callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    max_sequence_length: int = 256,
+    skip_guidance_layers: List[int] = None,
+    skip_layer_guidance_scale: float = 2.8,
+    skip_layer_guidance_stop: float = 0.2,
+    skip_layer_guidance_start: float = 0.01,
+    mu: Optional[float] = None,
+):
+    
+
+    height = height or pipe.default_sample_size * pipe.vae_scale_factor
+    width = width or pipe.default_sample_size * pipe.vae_scale_factor
+
+    # 2. Define call parameters
+    if prompt is not None and isinstance(prompt, str):
+        batch_size = 1
+    elif prompt is not None and isinstance(prompt, list):
+        batch_size = len(prompt)
+    else:
+        batch_size = prompt_embeds.shape[0]
+
+    device = pipe._execution_device
+
+    # lora_scale = (
+    #     pipe.joint_attention_kwargs.get("scale", None) if pipe.joint_attention_kwargs is not None else None
+    # )
+    lora_scale=None
+    (
+        prompt_embeds,
+        negative_prompt_embeds,
+        pooled_prompt_embeds,
+        negative_pooled_prompt_embeds,
+    ) = pipe.encode_prompt(
+        prompt=prompt,
+        prompt_2=prompt_2,
+        prompt_3=prompt_3,
+        negative_prompt=negative_prompt,
+        negative_prompt_2=negative_prompt_2,
+        negative_prompt_3=negative_prompt_3,
+        do_classifier_free_guidance=pipe.do_classifier_free_guidance,
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+        device=device,
+        clip_skip=pipe.clip_skip,
+        num_images_per_prompt=num_images_per_prompt,
+        max_sequence_length=max_sequence_length,
+        lora_scale=lora_scale,
+    )
+
+    if pipe.do_classifier_free_guidance:
+        if skip_guidance_layers is not None:
+            original_prompt_embeds = prompt_embeds
+            original_pooled_prompt_embeds = pooled_prompt_embeds
+        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+
+    # 4. Prepare latent variables
+    num_channels_latents = pipe.transformer.config.in_channels
+    latents = pipe.prepare_latents(
+        batch_size * num_images_per_prompt,
+        num_channels_latents,
+        height,
+        width,
+        prompt_embeds.dtype,
+        device,
+        generator,
+        latents,
+    )
+
+    # 5. Prepare timesteps
+    scheduler_kwargs = {}
+    if pipe.scheduler.config.get("use_dynamic_shifting", None) and mu is None:
+        _, _, height, width = latents.shape
+        image_seq_len = (height // pipe.transformer.config.patch_size) * (
+            width // pipe.transformer.config.patch_size
+        )
+        mu = calculate_shift(
+            image_seq_len,
+            pipe.scheduler.config.base_image_seq_len,
+            pipe.scheduler.config.max_image_seq_len,
+            pipe.scheduler.config.base_shift,
+            pipe.scheduler.config.max_shift,
+        )
+        scheduler_kwargs["mu"] = mu
+    elif mu is not None:
+        scheduler_kwargs["mu"] = mu
+    timesteps, num_inference_steps = retrieve_timesteps(
+        pipe.scheduler,
+        num_inference_steps,
+        device,
+        sigmas=sigmas,
+        **scheduler_kwargs,
+    )
+    num_warmup_steps = max(len(timesteps) - num_inference_steps * pipe.scheduler.order, 0)
+    pipe._num_timesteps = len(timesteps)
+
+    # 6. Prepare image embeddings
+    if (ip_adapter_image is not None and pipe.is_ip_adapter_active) or ip_adapter_image_embeds is not None:
+        ip_adapter_image_embeds = pipe.prepare_ip_adapter_image_embeds(
+            ip_adapter_image,
+            ip_adapter_image_embeds,
+            device,
+            batch_size * num_images_per_prompt,
+            pipe.do_classifier_free_guidance,
+        )
+
+        if pipe.joint_attention_kwargs is None:
+            pipe._joint_attention_kwargs = {"ip_adapter_image_embeds": ip_adapter_image_embeds}
+        else:
+            pipe._joint_attention_kwargs.update(ip_adapter_image_embeds=ip_adapter_image_embeds)
+
+    return prompt_embeds,pooled_prompt_embeds,timesteps,latents

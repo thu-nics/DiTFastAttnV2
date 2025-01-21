@@ -37,7 +37,7 @@ def transform_model_dfa(model, n_steps=20, window_func=None):
             if isinstance(module.attn, Attention):
                 module.attn.processor = MMDiTFastAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
                 dfa_config.add_attn_processor(name + ".attn", module.attn.processor)
-            if isinstance(module.ff, FeedForward):
+            if isinstance(module.ff, FeedForward) or isinstance(module.ff, DiTFastAttnFFN):
                 module.ff = DiTFastAttnFFN(module.ff, steps_method=["raw" for _ in range(n_steps)])
                 dfa_config.add_ffn_layer(name + ".ff", module.ff)
     return dfa_config
@@ -198,7 +198,7 @@ class MethodSpeedup:
             self.candidates.append(candidate)
             # self.speedup_dict[candidate] = 0
     
-    def generate_latency(self, mode='estimate', pipe=None, n_steps=20, dfa_config=None, *args, **kwargs):
+    def generate_latency(self, mode='estimate', pipe=None, n_steps=20, dfa_config=None, headwise_window_attn=False, *args, **kwargs):
         if mode == "estimate":
             for candidate in self.candidates:
                 print(candidate)
@@ -268,6 +268,9 @@ class MethodSpeedup:
             if method != "raw":
                 if layer_type == "attn":
                     latency[(layer_type, method)] = raw_attn_lattency - latency_dict[(layer_type, method)].item()
+                    if headwise_window_attn:
+                        if "window_attn" in method:
+                            latency[(layer_type, method)] = latency[(layer_type, method)] / 16
                 elif layer_type == "ff":
                     latency[(layer_type, method)] = raw_ff_lattency - latency_dict[(layer_type, method)].item()
         return latency

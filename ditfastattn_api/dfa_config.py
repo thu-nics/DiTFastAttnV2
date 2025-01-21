@@ -1,5 +1,6 @@
 # DEFAULT_ATTN_CANDIDATES = ["output_share", "residual_window_attn_128", "residual_window_attn_256"]
 DEFAULT_ATTN_CANDIDATES = ["output_share"]
+# DEFAULT_ATTN_CANDIDATES = ["output_share"]
 # DEFAULT_ATTN_CANDIDATES = ["raw", "output_share"]
 DEFAULT_FFN_CANDIDATES = ["output_share"]
 import copy
