@@ -51,6 +51,22 @@ class MMDiTFastAttnProcessor:
         window_size_candidates = [0.5,0.4,0.3,0.2,0.1]
         self.relative_MSE_threshold=0.01 # hyperparameter
         self.evaluated_latency=None
+
+    def create_attn_mask(window_size, seq_len, vtok_len):
+        mask = torch.zeros(seq_len, seq_len)
+
+        # Fill the mask with 1s within the window around each token
+        for i in range(seq_len):
+            # Calculate the start and end of the window
+            if i < vtok_len:
+                start = max(0, i - window_size)
+                end = min(vtok_len, i + window_size + 1)
+                mask[i, start:end] = 1
+                mask[i,vtok_len:] = 1
+            else:
+                mask[i, :] = 1
+        return mask
+        
         
     def update_config(self, **kwargs):
         for key, value in kwargs.items():
@@ -76,6 +92,61 @@ class MMDiTFastAttnProcessor:
                         break
             steps_residual_config.append(residual_config)
         return steps_residual_config
+    
+    def get_attention_scores(
+        self, query: torch.Tensor, key: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, scale
+    ) -> torch.Tensor:
+        r"""
+        Compute the attention scores.
+
+        Args:
+            query (`torch.Tensor`): The query tensor.
+            key (`torch.Tensor`): The key tensor.
+            attention_mask (`torch.Tensor`, *optional*): The attention mask to use. If `None`, no mask is applied.
+
+        Returns:
+            `torch.Tensor`: The attention probabilities/scores.
+        """
+        dtype = query.dtype
+        if self.upcast_attention:
+            query = query.float()
+            key = key.float()
+
+        # if attention_mask is None:
+        #     baddbmm_input = torch.empty(
+        #         query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device
+        #     )
+        #     beta = 0
+        # else:
+        #     baddbmm_input = attention_mask
+        #     beta = 1
+
+        baddbmm_input = torch.empty(
+            query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device
+        )
+        beta = 0
+
+        attention_scores = torch.baddbmm(
+            baddbmm_input,
+            query,
+            key.transpose(-1, -2),
+            beta=beta,
+            alpha=scale,
+        )
+        del baddbmm_input
+
+        # apply attention mask
+        attention_scores = attention_scores * attention_mask.unsqueeze(0).unsqueeze(-1)
+
+        if self.upcast_softmax:
+            attention_scores = attention_scores.float()
+
+        attention_probs = attention_scores.softmax(dim=-1)
+        del attention_scores
+
+        attention_probs = attention_probs.to(dtype)
+
+        return attention_probs
     
     def run_forward(self, attn:Attention, hidden_states, encoder_hidden_states, qkv_process_func):
         
@@ -157,6 +228,30 @@ class MMDiTFastAttnProcessor:
         # window_size_candidates = [0.995,0.99,0.98,0.97,0.96,0.95]
         headwise_relative_MSE={} # key (head, method) value: relative MSE = 均方误差（MSE）与目标变量方差的比值 （maybe）
         latency_delta={}
+        attn=forward_args["attn"]
+        candidates = self.dfa_config.get_available_candidates(attn.name)
+        _, S, _, _ = query.shape
+        full_hidden_states = flash_attn.flash_attn_func(query, key, value)
+        for candidate in candidates:
+            if "window_attn" in candidate:
+                window_size_factor = candidate.split("_")[-1]
+                if window_size_factor not in self.block_mask.keys():
+                    sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // window_size_factor, vtok_len=S - 333)
+                    block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+                    self.block_mask[window_size_factor] = block_mask
+                hidden_states = self.window_func(
+                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask[window_size_factor]
+                ).transpose(1, 2)
+                torch.cuda.synchronize()
+                if "without" not in candidate:
+                    hidden_states = hidden_states + self.cached_residual
+            elif candidate == 'output_share':
+                hidden_states = self.prev_calib_output
+            breakpoint()
+            rse = ((hidden_states - full_hidden_states)**2).mean(keepdim=-1) / ((full_hidden_states - full_hidden_states.mean(keepdim=-1))**2).mean()
+            self.headwise_relative_MSE[candidate] = rse
+
+
         # without residual share
         
         # with residual share (latency *1.5)

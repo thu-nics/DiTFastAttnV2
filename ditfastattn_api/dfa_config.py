@@ -9,6 +9,7 @@ import copy
 class DiTFastAttnConfig:
     def __init__(self):
         self.layers = {}
+        self.latency = {}
 
     def add_attn_processor(self, layer_name, attn_processor, candidates=DEFAULT_ATTN_CANDIDATES):
         kwargs = {
@@ -62,6 +63,12 @@ class DiTFastAttnConfig:
         for layer_name in self.layers.keys():
             res = res + "name: " + layer_name + "method: " + self.get_layer_step_method(layer_name, step_idx) + "\n"
         print(res)
+
+    def set_latency(self, latency_dict):
+        self.latency = latency_dict
+
+    def get_candidate_latency(self, candidate):
+        return self.latency[candidate]
 
     @property
     def layer_names(self):
