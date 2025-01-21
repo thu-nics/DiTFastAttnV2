@@ -85,10 +85,13 @@ def _full_attn_fwd_inner(
 
 # add N_CTXV as the sequence length of vision tokens
 @triton.jit
-def _headwise_win_attn_fwd_inner(
+def _headwise_full_attn_window_residual_fwd_inner(
     acc,
     l_i,
     m_i,
+    win_acc,
+    win_l_i,
+    win_m_i,
     q,  #
     K_block_ptr,
     V_block_ptr,  #
@@ -109,64 +112,14 @@ def _headwise_win_attn_fwd_inner(
     # tl.device_print("arrow_mask", arrow_mask[0])
     # n_rows = N_CTXV // BLOCK_M
     
-    start_block_ind = tl.maximum((-left_window_size)//BLOCK_M +cur_block_row_id,0)
-    end_block_ind=tl.minimum(right_window_size//BLOCK_M+cur_block_row_id, vis_token_len//BLOCK_M)
+    window_start_ind = tl.maximum((-left_window_size)//BLOCK_M +cur_block_row_id,0)*BLOCK_M
+    window_end_ind=tl.minimum(right_window_size//BLOCK_M+cur_block_row_id, vis_token_len//BLOCK_M)*BLOCK_M
     
-    kv_movement_offset=BLOCK_N*start_block_ind
-    K_block_ptr = tl.advance(K_block_ptr, (0, kv_movement_offset))
-    V_block_ptr = tl.advance(V_block_ptr, (kv_movement_offset, 0))
-    for i in tl.range(start_block_ind,end_block_ind):
-        
-        # # -- load k, v --
-        k = tl.load(K_block_ptr,boundary_check=(0,1),padding_option="zero")
-        v = tl.load(V_block_ptr,boundary_check=(0,1),padding_option="zero")
-        # # -- compute qk ---
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
-        
-        qk = tl.where(offs_n+(start_block_ind+i)*BLOCK_N < vis_token_len+txt_token_len, qk, float("-inf"))
-
-        # # ######################### debug #################################
-        # # tl.store(dbg_block_ptr, qk)
-        # # #################################################################
-
-        # -- compute scaling constant ---
-        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-        alpha = tl.math.exp2(m_i - m_i_new)
-        p = tl.math.exp2(qk - m_i_new[:, None])
-        
-
-        # -- update output accumulator -- 
-        acc *= alpha[:, None]
-        
-        # update acc
-        if fp8_v:
-            p = p.to(tl.float8e5)
-        else:
-            p = p.to(V_block_ptr.dtype.element_ty)
-        acc = tl.dot(p, v, acc)
-        # -- update m_i and l_i
-        l_i = l_i * alpha + tl.sum(p, 1)
-        # if tl.program_id(0)==0 and tl.program_id(1)==0:
-        #     tl.device_print("l_i",tl.max(l_i))
-        m_i = m_i_new
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        # if tl.program_id(0)==0 and tl.program_id(1)==0:
-        #     # tl.device_print("kv_movement_offset2",kv_movement_offset2)
-        #     # tl.device_print("acc",acc)
-        #     tl.device_print("acc",tl.max(acc))
-    # process the txt tokens
-    kv_movement_offset2=(vis_token_len//BLOCK_N-end_block_ind)*BLOCK_N
-    K_block_ptr = tl.advance(K_block_ptr, (0, kv_movement_offset2))
-    V_block_ptr = tl.advance(V_block_ptr, (kv_movement_offset2, 0))
+    # if tl.program_id(0)==0 and tl.program_id(1)==0:
+    #     tl.device_print("col_ind window_start, window_end",window_start_ind*1000+window_end_ind)
     
-    # tl.device_print("col_ind",vis_token_len)
-    
-    
-
-    for col_ind in tl.range(vis_token_len, vis_token_len+txt_token_len, BLOCK_N):
-            
+    for col_ind in tl.range(0, vis_token_len+txt_token_len, BLOCK_N):
+        
         # # -- load k, v --
         k = tl.load(K_block_ptr,boundary_check=(0,1),padding_option="zero")
         v = tl.load(V_block_ptr,boundary_check=(0,1),padding_option="zero")
@@ -184,10 +137,9 @@ def _headwise_win_attn_fwd_inner(
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
         alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(qk - m_i_new[:, None])
-
+        
         # -- update output accumulator -- 
         acc *= alpha[:, None]
-        
         
         # update acc
         if fp8_v:
@@ -197,29 +149,34 @@ def _headwise_win_attn_fwd_inner(
         acc = tl.dot(p, v, acc)
         # -- update m_i and l_i
         l_i = l_i * alpha + tl.sum(p, 1)
-        
-        # if tl.program_id(0)==0 and tl.program_id(1)==0:
-        #     # tl.device_print("tl.sum(p, 1)",tl.max(tl.sum(p, 1)))
-        #     tl.device_print("qk",qk)
         m_i = m_i_new
+        
+        if col_ind >= window_start_ind and col_ind < window_end_ind:
+            # if tl.program_id(0)==0 and tl.program_id(1)==0:
+            #     tl.device_print("win_acc and col_ind",tl.max(win_acc)+col_ind*1000)
+            win_m_i_new = tl.maximum(win_m_i, tl.max(qk, 1))
+            win_alpha=tl.math.exp2(win_m_i-win_m_i_new)
+            win_p=tl.math.exp2(qk-win_m_i_new[:,None])
+            win_p = win_p.to(V_block_ptr.dtype.element_ty)
+            win_acc*=win_alpha[:,None]
+            win_acc=tl.dot(win_p,v,win_acc)
+            win_l_i=win_l_i*win_alpha+tl.sum(win_p,1)
+            win_m_i=win_m_i_new
+            # if tl.program_id(0)==0 and tl.program_id(1)==0:
+            #     tl.device_print("win_acc",tl.max(win_acc))
+            
+        
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        
-        # if tl.program_id(0)==0 and tl.program_id(1)==0:
-        #     # tl.device_print("col_ind",col_ind)
-        #     # tl.device_print("acc2",tl.max(acc))
-        #     # tl.device_print("v",tl.max(v))
-        #     tl.device_print("l_i",tl.max(l_i))
-        
 
-    return acc, l_i, m_i
+    return acc, l_i, m_i, win_acc, win_l_i, win_m_i
     
     
 
 
-@triton.autotune(configs, key=["txt_token_len", "vis_token_len", "HEAD_DIM","BLOCK_M"])
+# @triton.autotune(configs, key=["txt_token_len", "vis_token_len", "HEAD_DIM","BLOCK_M"])
 @triton.jit
-def _blockwise_window_mm_attn_fwd(
+def _blockwise_full_mm_attn_with_window_residual_fwd(
     Q,
     K,
     V,
@@ -228,6 +185,7 @@ def _blockwise_window_mm_attn_fwd(
     right_window_size_ptr,
     M,
     Out,  #
+    Residual,
     # debug_ptr, # for debug output
     stride_qz: tl.constexpr,
     stride_qh: tl.constexpr,
@@ -296,6 +254,14 @@ def _blockwise_window_mm_attn_fwd(
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
+    Residual_block_ptr = tl.make_block_ptr(
+        base=Residual + qvk_offset,
+        shape=(txt_token_len+vis_token_len, HEAD_DIM),
+        strides=(stride_om, stride_on),
+        offsets=(cur_block_row_id * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
     # row_mask_len = N_CTXV // BLOCK_N
     left_window_size = tl.load(left_window_size_ptr + cur_head_id, eviction_policy="evict_last")
     right_window_size = tl.load(right_window_size_ptr + cur_head_id, eviction_policy="evict_last")
@@ -307,6 +273,8 @@ def _blockwise_window_mm_attn_fwd(
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    
+    
 
     q = tl.load(Q_block_ptr)
     qk_scale = sm_scale
@@ -317,10 +285,16 @@ def _blockwise_window_mm_attn_fwd(
 
     # tested, works fine
     if cur_block_row_id < (vis_token_len // BLOCK_M):
-        acc, l_i, m_i = _headwise_win_attn_fwd_inner(
+        win_m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        win_l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        win_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        acc, l_i, m_i,win_acc, win_l_i, win_m_i = _headwise_full_attn_window_residual_fwd_inner(
             acc,
             l_i,
             m_i,
+            win_acc,
+            win_l_i,
+            win_m_i,
             q,
             K_block_ptr,
             V_block_ptr,  #
@@ -338,6 +312,12 @@ def _blockwise_window_mm_attn_fwd(
             V.dtype.element_ty == tl.float8e5,  #
             # V.dtype.element_ty == tl.float16,  #
         )
+        l_i = tl.where(l_i == 0.0, 1, l_i)
+        acc = acc / l_i[:, None]
+        win_l_i = tl.where(win_l_i == 0.0, 1, win_l_i)
+        reisudal_acc = acc-(win_acc / win_l_i[:, None])
+        tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+        tl.store(Residual_block_ptr, reisudal_acc.to(Out.type.element_ty))
     else:
         acc, l_i, m_i = _full_attn_fwd_inner(
             acc,
@@ -360,15 +340,12 @@ def _blockwise_window_mm_attn_fwd(
             V.dtype.element_ty == tl.float8e5,  #
             # V.dtype.element_ty == tl.float16,  #
         )
-    # m_i += tl.math.log2(l_i)
-    l_i = tl.where(l_i == 0.0, 1, l_i)
-    acc = acc / l_i[:, None]
-    # m_ptrs = M + off_hz * (txt_token_len+vis_token_len) + offs_m
-    # tl.store(m_ptrs, m_i)
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+        l_i = tl.where(l_i == 0.0, 1, l_i)
+        acc = acc / l_i[:, None]
+        tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+        tl.store(Residual_block_ptr, tl.zeros_like(acc).to(Out.type.element_ty))
 
-
-class _attention(torch.autograd.Function):
+class _full_mm_attention_with_window_residual(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -400,6 +377,7 @@ class _attention(torch.autograd.Function):
         assert hdk in {16, 32, 64, 128, 256}
 
         o = torch.empty_like(q)
+        residual = torch.empty_like(q)
 
         # Lse
         L = torch.empty((bs, nhq, query_len), device=q.device, dtype=torch.float32)
@@ -418,7 +396,7 @@ class _attention(torch.autograd.Function):
         grid = (triton.cdiv(query_len, block_size), bs * nhq, 1)
 
         # print(block_size,grid)
-        _blockwise_window_mm_attn_fwd[grid](
+        _blockwise_full_mm_attn_with_window_residual_fwd[grid](
             q,
             k,
             v,
@@ -427,6 +405,7 @@ class _attention(torch.autograd.Function):
             right_window_size,
             L,
             o,  #
+            residual,
             # debug,
             q.stride(0),
             q.stride(1),
@@ -451,14 +430,13 @@ class _attention(torch.autograd.Function):
             HEAD_DIM=hdk,  #
             **extra_kern_args,
         )
-        return o
+        return o, residual
 
     @staticmethod
     def backward(ctx, do):
         raise NotImplementedError("Backward pass is not implemented yet.")
 
-
-def blockwise_window_mm_attn(
+def full_mm_attn_with_window_residual(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -494,5 +472,5 @@ def blockwise_window_mm_attn(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(k.shape[-1])
 
-    o = _attention.apply(q, k, v, sm_scale, vis_token_len, txt_token_len, left_window_size, right_window_size, block_size)
-    return o
+    o,window_residual = _full_mm_attention_with_window_residual.apply(q, k, v, sm_scale, vis_token_len, txt_token_len, left_window_size, right_window_size, block_size)
+    return o,window_residual

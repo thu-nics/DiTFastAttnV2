@@ -88,14 +88,15 @@ def dataloader():
 # pipe.transformer.to(torch.float16)
 
 latency = dfa_test_latency(pipe, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
-dfa_config = transform_model_dfa(pipe.transformer, n_steps=n_steps*2, window_func=flex_attn_block_mask_compiled)
+# dfa_config = transform_model_dfa(pipe.transformer, n_steps=n_steps*2, window_func=flex_attn_block_mask_compiled)
 # generate_ground_truth(pipe, dataloader, model_misc)
 dfa_config = transform_model_dfa(pipe.transformer, n_steps=n_steps, window_func=flex_attn_block_mask_compiled)
 
 ms = MethodSpeedup()
 ms.load_candidates(dfa_config.get_available_candidates(dfa_config.layer_names[0]))
-latency_dict = ms.generate_latency('test', pipe, n_steps, dfa_config, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
+latency_dict = ms.generate_headwise_latency('test', pipe, n_steps, dfa_config, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
 print(latency_dict)
+breakpoint()
 torch.save(latency_dict, "cache/latency_dict.json")
 # latency = dfa_test_latency(pipe, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
 # breakpoint()

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import flash_attn
 import copy
 from time import time
+from ilp import solve_ip
 
 # from natten.functional import na1d, na2d
 import torch.nn as nn
@@ -45,6 +46,7 @@ class MMDiTFastAttnProcessor:
         self.cached_output = None
         self.dfa_config=None
         self.stepi=0
+        self.curr_window_factor = None
         
         # self.attn_weight=0
         # self.attn_weight_num_count=0
@@ -94,7 +96,7 @@ class MMDiTFastAttnProcessor:
         return steps_residual_config
     
     def get_attention_scores(
-        self, query: torch.Tensor, key: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, scale
+        self, query: torch.Tensor, key: torch.Tensor, scale, attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         r"""
         Compute the attention scores.
@@ -224,16 +226,17 @@ class MMDiTFastAttnProcessor:
         # witout residual share window attention
         pass
     
-    def calib_qkv_process_func(self, query, key, value, forward_args):
+    def calib_qkv_process_func(self, query, key, value, alpha, forward_args):
         # window_size_candidates = [0.995,0.99,0.98,0.97,0.96,0.95]
         headwise_relative_MSE={} # key (head, method) value: relative MSE = 均方误差（MSE）与目标变量方差的比值 （maybe）
-        latency_delta={}
+        # latency_delta={}
         attn=forward_args["attn"]
         candidates = self.dfa_config.get_available_candidates(attn.name)
         _, S, _, _ = query.shape
         full_hidden_states = flash_attn.flash_attn_func(query, key, value)
         for candidate in candidates:
             if "window_attn" in candidate:
+                # without residual share
                 window_size_factor = candidate.split("_")[-1]
                 if window_size_factor not in self.block_mask.keys():
                     sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // window_size_factor, vtok_len=S - 333)
@@ -243,25 +246,22 @@ class MMDiTFastAttnProcessor:
                     query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask[window_size_factor]
                 ).transpose(1, 2)
                 torch.cuda.synchronize()
+                # with residual share (latency *1.5)
                 if "without" not in candidate:
                     hidden_states = hidden_states + self.cached_residual
+            # output share
             elif candidate == 'output_share':
                 hidden_states = self.prev_calib_output
             breakpoint()
-            rse = ((hidden_states - full_hidden_states)**2).mean(keepdim=-1) / ((full_hidden_states - full_hidden_states.mean(keepdim=-1))**2).mean()
-            self.headwise_relative_MSE[candidate] = rse
+            rse = ((hidden_states - full_hidden_states)**2).mean(dim=-1) / ((full_hidden_states - full_hidden_states.mean(dim=-1))**2).mean(dim=-1).cpu().item()
+            for h in rse.shape[0]:
+                headwise_relative_MSE[(h, candidate)] = rse
 
-
-        # without residual share
-        
-        # with residual share (latency *1.5)
-        
-        # output share
-        
         # ILP: target is to minimize the latency given MSE is below a threshold (?)
-        
-        # per head, gen kernel
+        head_method_list = solve_ip(headwise_relative_MSE,self.dfa_config.latency, alpha)
 
+        # per head, gen kernel
+        
     def get_attn_weight_qkv_process_func(self, query, key, value, forward_args):
         # breakpoint()
         score=torch.matmul(query, key.transpose(-1, -2))
@@ -295,7 +295,7 @@ class MMDiTFastAttnProcessor:
         _, S, _, _ = query.shape
         if self.block_mask is None:
             print(f"Compile window attention kernel 2")
-            sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // 8, vtok_len=S - 333)
+            sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // self.curr_window_factor, vtok_len=S - 333)
             block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
             self.block_mask = block_mask
         hidden_states = self.window_func(
@@ -303,6 +303,20 @@ class MMDiTFastAttnProcessor:
         ).transpose(1, 2)
         torch.cuda.synchronize()
         hidden_states = hidden_states + self.cached_residual
+        # Add residual
+        return hidden_states
+    
+    def window_attn_no_residual_qkv_process_func(self, query, key, value, forward_args):
+        _, S, _, _ = query.shape
+        if self.block_mask is None:
+            print(f"Compile window attention kernel 2")
+            sliding_window_mask = generate_partial_sliding_window(window_size=(S - 333) // self.curr_window_factor, vtok_len=S - 333)
+            block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+            self.block_mask = block_mask
+        hidden_states = self.window_func(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.block_mask
+        ).transpose(1, 2)
+        torch.cuda.synchronize()
         # Add residual
         return hidden_states
             
@@ -317,7 +331,8 @@ class MMDiTFastAttnProcessor:
         **kwargs,
     ) -> torch.FloatTensor:
         if self.forward_mode == "calib_collect_info":
-            qkv_process_func=self.calib_collect_info_qkv_process_func
+            # qkv_process_func=self.calib_collect_info_qkv_process_func
+            qkv_process_func=  self.calib_qkv_process_func
             
         elif self.forward_mode == "calib_post_inference":
             # breakpoint()
@@ -337,9 +352,14 @@ class MMDiTFastAttnProcessor:
                     qkv_process_func=self.raw_qkv_process_func
             elif self.steps_method[self.stepi] == "output_share":
                 return self.cached_output
-            elif "residual_window_attn" in self.steps_method[self.stepi]:
-                qkv_process_func=self.window_attn_qkv_process_func
+            elif "window_attn" in self.steps_method[self.stepi]:
+                self.curr_window_factor = int(self.steps_method[self.stepi].split("_")[-1])
+                if "without" not in self.steps_method[self.stepi]:
+                    qkv_process_func=self.window_attn_qkv_process_func
+                else:
+                    qkv_process_func=self.window_attn_no_residual_qkv_process_func
         
         hidden_states, encoder_hidden_states = self.run_forward(attn, hidden_states, encoder_hidden_states, qkv_process_func)
+        self.curr_window_factor = None
         return hidden_states, encoder_hidden_states
         

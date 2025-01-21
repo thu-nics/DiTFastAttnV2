@@ -7,7 +7,7 @@ from ditfastattn_api.modules.dfa_ffn import DiTFastAttnFFN
 # from ditfastattn_api.modules.dfa_processor import DiTFastAttnProcessor, MMDiTFastAttnProcessor
 # --------
 from ditfastattn_api.modules.dfa_processor import DiTFastAttnProcessor
-from ditfastattn_api.modules.dfa_processor_revised import MMDiTFastAttnProcessor
+from ditfastattn_api.modules.dfa_processor_attn_weight import MMDiTFastAttnProcessor
 # --------
 from ditfastattn_api.dfa_config import DiTFastAttnConfig
 import time
@@ -190,6 +190,7 @@ class MethodSpeedup:
         # examples of candidate: ("attn", "residual_window_attn"), ("ff", "output_share")
         self.candidates = []
         self.speedup_dict = {('attn','raw'):1, ('ff', 'raw'):1}
+        self.speedup_dict_headwise = {}
         self.vtok_len = vtok_len
         self.ttok_len = ttok_len
     
@@ -273,4 +274,81 @@ class MethodSpeedup:
                             latency[(layer_type, method)] = latency[(layer_type, method)] / 16
                 elif layer_type == "ff":
                     latency[(layer_type, method)] = raw_ff_lattency - latency_dict[(layer_type, method)].item()
+        return latency
+    
+    def generate_headwise_latency(self, mode='estimate', pipe=None, n_steps=20, dfa_config=None, *args, **kwargs):
+        if mode == "estimate":
+            for candidate in self.candidates:
+                print(candidate)
+                if candidate[1] == "output_share":
+                    print("It is output_share")
+                    self.speedup_dict_headwise[candidate] = 1
+                elif candidate[1] == "cfg_share":
+                    print("It is cfg_share")
+                    self.speedup_dict_headwise[candidate] = 0.5
+                elif "window_attn" in candidate[1]:
+                    print("It is window attn")
+                    window_size = self.vtok_len // 8
+                    full_computation = (self.vtok_len + self.ttok_len)**2
+                    ratio = (full_computation -  (self.vtok_len - window_size // 2) **2) / full_computation 
+                    if "cfg_attn_share" in candidate:
+                        ratio = ratio / 2
+                    self.speedup_dict_headwise[candidate] = 1 - ratio
+        elif mode == "test":
+            # TODO: identify model type
+            block_class = JointTransformerBlock
+            attn_class = Attention
+            ffn_class = FeedForward
+            # latency for raw
+            for name, module in pipe.transformer.named_modules():
+                module.name = name
+                if isinstance(module, block_class):
+                    # for MMDiT
+                    if isinstance(module.attn, attn_class):
+                        module.attn.processor.need_cache_output = False
+                        module.attn.processor.cache_residual_forced = False
+                        module.attn.processor.calib_mode = "off"
+                    # if isinstance(module.ff, DiTFastAttnFFN):
+                    #     module.ff.need_cache_output = False
+
+            attn_latency, ffn_latency = dfa_test_layer_latency(pipe, n_steps, *args, **kwargs)
+            self.speedup_dict_headwise['raw'] = attn_latency
+            # self.speedup_dict[('ff', 'raw')] = ffn_latency
+
+            for name, module in pipe.transformer.named_modules():
+                module.name = name
+                if isinstance(module, block_class):
+                    # for MMDiT
+                    if isinstance(module.attn, attn_class):
+                        module.attn.processor.need_cache_output = True
+                    # if isinstance(module.ff, DiTFastAttnFFN):
+                    #     module.ff.need_cache_output = True
+
+            total_step = len(dfa_config.layers[dfa_config.layer_names[0]]['kwargs']['steps_method'])
+            for candidate in self.candidates:
+                for layer_name in dfa_config.layers.keys():
+                    for step_idx in range(1, total_step):
+                        # dfa_test_layer_latency()
+                        dfa_config.set_layer_step_method(layer_name, step_idx, candidate)
+                attn_latency, ffn_latency = dfa_test_layer_latency(pipe, n_steps, *args, **kwargs)
+                if "without" not in candidate:
+                    attn_latency = attn_latency * 1.5
+                self.speedup_dict_headwise[candidate] = attn_latency
+                # if 'window_attn' not in candidate:
+                #     self.speedup_dict[('ff', candidate)] = ffn_latency
+
+            for step_idx in range(1, total_step):
+                dfa_config.reset_step_method(step_idx)
+        latency_dict = self.speedup_dict_headwise
+        latency = {}
+        raw_attn_lattency = latency_dict['raw'].item()
+        # raw_ff_lattency = latency_dict[('ff', 'raw')].item()
+        for method in latency_dict.keys():
+            print(f"method: {method}")
+            if method != "raw":
+                breakpoint()
+                # if layer_type == "attn":
+                latency[method] = raw_attn_lattency - latency_dict[method].item()
+                # elif layer_type == "ff":
+                #     latency[(layer_type, method)] = raw_ff_lattency - latency_dict[(layer_type, method)].item()
         return latency
