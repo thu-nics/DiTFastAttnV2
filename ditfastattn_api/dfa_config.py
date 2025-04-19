@@ -1,7 +1,8 @@
-# DEFAULT_ATTN_CANDIDATES = ["output_share", "residual_window_attn_128", "residual_window_attn_256"]
-DEFAULT_ATTN_CANDIDATES = ["output_share", "residual_window_attn_4", "residual_window_attn_8", "residual_window_attn_16",]
-# DEFAULT_ATTN_CANDIDATES = ["output_share"]
-# DEFAULT_ATTN_CANDIDATES = ["raw", "output_share"]
+DEFAULT_ATTN_CANDIDATES = ["output_share", 
+                           "arrow_attn_8", 
+                           "arrow_attn_16",
+                           "arrow_attn_32"]
+# check candidates order, make sure the method with less computation reduction come first
 DEFAULT_FFN_CANDIDATES = ["output_share"]
 import copy
 
@@ -10,6 +11,10 @@ class DiTFastAttnConfig:
     def __init__(self):
         self.layers = {}
         self.latency = {}
+        self.plan = {}
+        self.wt = {}
+        self.ffn_plan = {}
+        self.output_share_dict = {}
 
     def add_attn_processor(self, layer_name, attn_processor, candidates=DEFAULT_ATTN_CANDIDATES):
         kwargs = {

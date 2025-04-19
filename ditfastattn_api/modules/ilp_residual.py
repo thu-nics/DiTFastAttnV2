@@ -5,11 +5,15 @@ def form_head_method_name(head_num, method):
     method_abbr = ""
     if method == "output_share":
         method_abbr = "ast"
-        window_size = 0
+        window_size = "0"
     elif "window_attn" in method:
-        method_abbr = "wars"
-        window_size = method.split("_")[-1]
-    return "_".join([method_abbr, window_size, head_num])
+        if "residual" in method:
+            method_abbr = "wars"
+            window_size = "-" + method.split("_")[-1]
+        else:
+            method_abbr = "wa"
+            window_size = method.split("_")[-1]
+    return "_".join([method_abbr, window_size, str(head_num)])
 
 def set_constraint(model, head_set, head_method_dict, alpha):
     # set constraint 
@@ -18,8 +22,7 @@ def set_constraint(model, head_set, head_method_dict, alpha):
         for name in head_method_dict.keys():
             if head_method_dict[name]['head'] == head:
                 temp_name_list.append(name)
-        # print(temp_name_list)
-        constraint_name = "_".join(["con", head])
+        constraint_name = "_".join(["con", str(head)])
         if len(temp_name_list) > 1:
             def ConsRule(model):
                 lhs = []
@@ -28,10 +31,8 @@ def set_constraint(model, head_set, head_method_dict, alpha):
                     lhs.append(getattr(model, i))
                 return sum(lhs) <= 1
             temp_con = Constraint(rule=ConsRule)
-            # print(constraint_name)
             setattr(model, constraint_name, temp_con)
 
-    # alpha = 0.0001
     def ConsAlphaRule(model):
         lhs = []
         for name in head_method_dict.keys():
@@ -54,7 +55,7 @@ def solve_ip(influence_dict, latency_dict, alpha):
         model = ConcreteModel()
         head_set = set()
         for i in influence_dict:
-            head_num = i[0].split(".")
+            head_num = i[0]
             method = i[1]
             influence = influence_dict[i]
             name = form_head_method_name(head_num,  method)
@@ -73,24 +74,16 @@ def solve_ip(influence_dict, latency_dict, alpha):
             setattr(model, name, head_method_dict[name]['var'])
         # set constraint 
         set_constraint(model, head_set, head_method_dict, alpha)
-
         set_objective(model, head_method_dict)
 
-        # breakpoint()
-        # print("start solving ...")
+        solver = SolverFactory('glpk')
+        solver.solve(model)
 
-        # 求解器
-        solver = SolverFactory('glpk')  # 使用GLPK求解器
-        result = solver.solve(model)
-
-        # 输出结果
-        print("Status:", result.solver.status)
-        print(result['Solver'][0]['Termination condition'])
+        # print("Status:", result.solver.status)
+        # print(result['Solver'][0]['Termination condition'])
         for name in head_method_dict.keys():
-            print(f"{name}: {head_method_dict[name]['var']()}")
             if head_method_dict[name]['var']() == 1:
-                res.append((head_method_dict[name]['full_name'], head_method_dict[name]['method']))
-    # breakpoint()
+                res.append((head_method_dict[name]['full_name'], name.split("_")[1]))
     return res
 
 

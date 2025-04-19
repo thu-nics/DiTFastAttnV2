@@ -235,10 +235,27 @@ def update_layer_influence_new(pipe, dataloader, dfa_config, model_misc, alpha=1
     return
 
 def update_layer_influence_two_phase(pipe, dataloader, dfa_config, model_misc, alpha):
-    for i, (args, kwargs) in enumerate(dataloader()):
+    for i, kwargs in enumerate(dataloader()):
+        print(f">>> calibration fisher info sample {i} <<<")
+        model_misc.inference_fn_with_backward_plan_update_binary_new_method_per_head(pipe, dfa_config, alpha, **kwargs)
+
+def set_flux_compression_plan(pipe, dataloader, dfa_config, model_misc, alpha):
+    for i, kwargs in enumerate(dataloader()):
         print(f">>> calibration fisher info sample {i} <<<")
         # breakpoint()
-        model_misc.inference_fn_with_backward_plan_update_binary_new_method(pipe, dfa_config, alpha, *args, **kwargs)
+        model_misc.inference_fn_plan_update_iop_per_head_flux(pipe, dfa_config, alpha, **kwargs)
+
+def set_cogvideox_compression_plan(pipe, dataloader, dfa_config, model_misc, alpha):
+    for i, kwargs in enumerate(dataloader()):
+        print(f">>> calibration fisher info sample {i} <<<")
+        # breakpoint()
+        model_misc.inference_fn_plan_update_iop_per_head_cogvideox(pipe, dfa_config, alpha, **kwargs)
+
+def set_pixart_compression_plan(pipe, dataloader, dfa_config, model_misc, alpha):
+    for i, kwargs in enumerate(dataloader()):
+        print(f">>> calibration fisher info sample {i} <<<")
+        # breakpoint()
+        model_misc.inference_fn_plan_update_iop_per_head_pixart(pipe, dfa_config, alpha, **kwargs)
 
 def generate_ground_truth(pipe, dataloader, model_misc):
     for i, (args, kwargs) in enumerate(dataloader()):

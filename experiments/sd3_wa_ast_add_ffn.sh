@@ -1,0 +1,3 @@
+# CUDA_VISIBLE_DEVICES=4 python sd3_generation.py --model_name sd3_wa_ast_add_ffn --method_set wa_ast --threshold 0.1 --eval_n_images 5000 --n_calib 8 --save_path data/sd3_wa_ast_add_ffn_1024_coco_5k &
+CUDA_VISIBLE_DEVICES=6 python sd3_generation.py --model_name sd3_wa_ast_add_ffn --method_set wa_ast --threshold 0.2 --eval_n_images 5000 --n_calib 8 --save_path data/sd3_wa_ast_add_ffn_1024_coco_5k &
+CUDA_VISIBLE_DEVICES=0 python sd3_generation.py --model_name sd3_wa_ast_add_ffn --method_set wa_ast --threshold 0.3 --eval_n_images 8 --n_calib 8 --save_path data/sd3_wa_ast_add_ffn_1024_coco_5k &

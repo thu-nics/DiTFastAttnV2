@@ -2,7 +2,8 @@ import torch
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
 from typing import List, Optional
 import torch.nn.functional as F
-import flash_attn
+# import flash_attn
+import flash_attn_ours
 import copy
 from time import time
 from ditfastattn_api.modules.ilp import solve_ip
@@ -49,7 +50,7 @@ def generate_sliding_window_per_head(head_list: List, block_size=64) -> _mask_mo
     sliding_window_mask.__name__ = f"sliding_window_multiple_size"
     return sliding_window_mask
 
-def headwise_cfg_attention(query, key, value, attn_func, head_mask, block_mask):
+def headwise_cfg_attention(query, key, value, head_mask, window_sizes):
     """
     自定义 attention 计算：
     - 对于 head_mask 为 True 的 head，只计算前一半 batch 的 attention，并复制到后一半。
@@ -73,10 +74,10 @@ def headwise_cfg_attention(query, key, value, attn_func, head_mask, block_mask):
         key_first_half = key_replace[:half_B]
         value_first_half = value_replace[:half_B]
 
-        attention_first_half = attn_func(query_first_half, 
-                                         key_first_half, 
-                                         value_first_half, 
-                                         block_mask=block_mask[1]).transpose(1,2)
+        attention_first_half = flash_attn_ours.headwise_window_attn(query_first_half.transpose(1,2), 
+                                         key_first_half.transpose(1,2), 
+                                         value_first_half.transpose(1,2), 
+                                         window_sizes=window_sizes[head_mask,:])
         torch.cuda.synchronize()
         attention_second_half = attention_first_half.clone()  # 复制到后一半 batch
         attention_replace = torch.cat([attention_first_half, attention_second_half], dim=0)  # shape: (B, S, H_replace, D)
@@ -85,10 +86,10 @@ def headwise_cfg_attention(query, key, value, attn_func, head_mask, block_mask):
 
     # 对于不需要替换的 head，正常计算所有 batch 的 attention
     if query_normal.size(2) > 0:  # 如果有不需要替换的 head
-        attention_normal = attn_func(query_normal, 
-                                     key_normal, 
-                                     value_normal,
-                                     block_mask=block_mask[0]).transpose(1,2)  # shape: (B, S, H_normal, D)
+        attention_normal = flash_attn_ours.headwise_window_attn(query_normal.transpose(1,2), 
+                                     key_normal.transpose(1,2), 
+                                     value_normal.transpose(1,2),
+                                     window_sizes=window_sizes[~head_mask,:])  # shape: (B, S, H_normal, D)
         torch.cuda.synchronize()
     else:
         attention_normal = torch.empty(B, S, 0, D, device=query.device)  # 如果没有不需要替换的 head，返回空张量
@@ -137,19 +138,29 @@ class DiTFastAttnProcessor:
         attn=forward_args["attn"]
         candidates = self.dfa_config.get_available_candidates(attn.name)
         B, H, S, _ = query.shape
-        full_hidden_states = flash_attn.flash_attn_func(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2))
+        full_hidden_states = flash_attn_ours.flash_attn_func(query.transpose(1,2), 
+                                                             key.transpose(1,2), 
+                                                             value.transpose(1,2))
         for candidate in candidates:
             if "window_attn" in candidate:
                 # without residual share
                 window_size_factor = int(candidate.split("_")[-1])
-                if window_size_factor not in self.block_mask.keys():
-                    sliding_window_mask = generate_sliding_window(window_size=S // window_size_factor)
-                    block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
-                    self.block_mask[window_size_factor] = block_mask
-                hidden_states = self.window_func(
-                    query, key, value, block_mask=self.block_mask[window_size_factor]
-                ).transpose(1, 2)
-                torch.cuda.synchronize()
+                # if window_size_factor not in self.block_mask.keys():
+                #     sliding_window_mask = generate_sliding_window(window_size=S // window_size_factor)
+                #     block_mask = create_block_mask(sliding_window_mask, None, None, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+                #     self.block_mask[window_size_factor] = block_mask
+                # hidden_states = self.window_func(
+                #     query, key, value, block_mask=self.block_mask[window_size_factor]
+                # ).transpose(1, 2)
+                # torch.cuda.synchronize()
+
+                # use flash_attn_func window
+                window_size = S // (window_size_factor * 2)
+                hidden_states = flash_attn_ours.flash_attn_func(query.transpose(1,2), 
+                                                                key.transpose(1,2), 
+                                                                value.transpose(1,2), 
+                                                                window_size=[window_size, window_size])
+
                 # with residual share (latency *1.5)
             # output share
             elif candidate == 'output_share':
@@ -175,7 +186,7 @@ class DiTFastAttnProcessor:
         # breakpoint()
         # per head, gen kernel
         if "cfg_share" not in candidates:
-            wt = torch.ones(16, dtype=torch.int64) * (S * 2)
+            wt = -torch.ones(16, dtype=torch.int32, device=query.device)
             self.output_share_dict[self.stepi] = []
             for head_method in head_method_list:
                 head = head_method[0]
@@ -184,24 +195,34 @@ class DiTFastAttnProcessor:
                     wt[head] = 0
                     self.output_share_dict[self.stepi].append(head)
                 else:
-                    wt[head] = S // (int(ws) * 2)
-            self.wt[self.stepi] = wt
+                    wt[head] = S // (int(ws)*2)
+            wt = wt.repeat_interleave(2, dim=0).view(-1, 2)
+            if self.dfa_config.mem_efficient:
+                self.wt[self.stepi] = wt.cpu()
+            else:
+                self.wt[self.stepi] = wt
 
-            if self.stepi not in self.timestep_block_mask.keys():
-                print(f"create block mask for {self.stepi}")
-                sliding_window_per_head_mask = generate_sliding_window_per_head(wt.to(query.device))
-                block_mask = create_block_mask(sliding_window_per_head_mask, None, H, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+            # if self.stepi not in self.timestep_block_mask.keys():
+            #     print(f"create block mask for {self.stepi}")
+            #     sliding_window_per_head_mask = generate_sliding_window_per_head(wt.to(query.device))
+            #     block_mask = create_block_mask(sliding_window_per_head_mask, None, H, S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
             # if attn.name == "transformer_blocks.7.attn":
             #     breakpoint()
-                self.timestep_block_mask[self.stepi] = block_mask
-            output = self.window_func(
-                query, key, value, block_mask=self.timestep_block_mask[self.stepi]
-            ).transpose(1, 2)
-            torch.cuda.synchronize()
+                # self.timestep_block_mask[self.stepi] = block_mask
+            if wt.any() == 0:
+                output = None
+            else:
+                output = flash_attn_ours.headwise_window_attn(
+                    query.transpose(1, 2), 
+                    key.transpose(1, 2), 
+                    value.transpose(1, 2), 
+                    window_sizes=wt
+                )
+            
 
         else:
             self.asc_enable = True
-            wt = torch.ones(16, dtype=torch.int64) * (S * 2)
+            wt = torch.ones(16, dtype=torch.int32, device=query.device) * (S * 2)
             cfg_mask = [False] * 16
             cfg_mask = torch.tensor(cfg_mask)
             self.output_share_dict[self.stepi] = []
@@ -214,52 +235,70 @@ class DiTFastAttnProcessor:
                     wt[head] = 0
                     self.output_share_dict[self.stepi].append(head)
                 else:
-                    wt[head] = (S - 333) // abs(int(ws))
-            self.wt[self.stepi] = wt
+                    wt[head] = (S - 333) // abs(int(ws) * 2)
+
+            wt = wt.repeat_interleave(2, dim=0).view(-1, 2)
+            if self.dfa_config.mem_efficient:
+                self.wt[self.stepi] = wt.cpu()
+            else:
+                self.wt[self.stepi] = wt
             if self.cfg_mask is None:
                 self.cfg_mask = {}
             self.cfg_mask[self.stepi] = cfg_mask
-            if self.stepi not in self.timestep_block_mask.keys():
-                print(f"create block mask for {self.stepi}")
-                if any(cfg_mask):
-                    print("asc adopted")
-                    sliding_window_per_head_mask_asc = generate_sliding_window_per_head(wt.to(query.device)[cfg_mask])
-                    block_mask_asc = create_block_mask(sliding_window_per_head_mask_asc, None, cfg_mask.sum().item(), S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
-                else:
-                    print("asc not adopted")
-                    block_mask_asc = None
-                sliding_window_per_head_mask = generate_sliding_window_per_head(wt.to(query.device)[~cfg_mask])
-                block_mask = create_block_mask(sliding_window_per_head_mask, None, H - cfg_mask.sum().item(), S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
-                self.timestep_block_mask[self.stepi] = (block_mask, block_mask_asc)
+            # if self.stepi not in self.timestep_block_mask.keys():
+            #     print(f"create block mask for {self.stepi}")
+            #     if any(cfg_mask):
+            #         print("asc adopted")
+            #         sliding_window_per_head_mask_asc = generate_sliding_window_per_head(wt.to(query.device)[cfg_mask])
+            #         block_mask_asc = create_block_mask(sliding_window_per_head_mask_asc, None, cfg_mask.sum().item(), S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+            #     else:
+            #         print("asc not adopted")
+            #         block_mask_asc = None
+            #     sliding_window_per_head_mask = generate_sliding_window_per_head(wt.to(query.device)[~cfg_mask])
+            #     block_mask = create_block_mask(sliding_window_per_head_mask, None, H - cfg_mask.sum().item(), S, S, device="cuda", _compile=True, BLOCK_SIZE=128)
+            #     self.timestep_block_mask[self.stepi] = (block_mask, block_mask_asc)
             
-            if block_mask_asc is not None:
-                output = headwise_cfg_attention(query, key, value, self.window_func, cfg_mask, self.timestep_block_mask[self.stepi])
+            if any(cfg_mask):
+                output = headwise_cfg_attention(query, key, value, cfg_mask, wt)
             else:
-                output = self.window_func(
-                    query, key, value, block_mask=self.timestep_block_mask[self.stepi][0]
-                ).transpose(1, 2)
+                if wt.any() == 0:
+                    output = None
+                else:
+                    output = flash_attn_ours.headwise_window_attn(
+                        query.transpose(1, 2), 
+                        key.transpose(1, 2), 
+                        value.transpose(1, 2), 
+                        window_sizes=wt
+                    )
         # B S H D
-        output[:,:,self.output_share_dict[self.stepi],:] = self.prev_calib_output[:,:,self.output_share_dict[self.stepi],:]
+        if len(self.output_share_dict[self.stepi]) == 16:
+            output = self.prev_calib_output
+        else:
+            output[:,:,self.output_share_dict[self.stepi],:] = self.prev_calib_output[:,:,self.output_share_dict[self.stepi],:]
         return output
     
 
     def qkv_process_perhead_func(self, query, key, value, forward_args):
-        breakpoint()
         _, _, S, _ = query.shape
         
         if self.asc_enable:
-            if self.timestep_block_mask[self.stepi][1] is not None:
-                output = headwise_cfg_attention(query, key, value, self.window_func, self.cfg_mask[self.stepi], self.timestep_block_mask[self.stepi])
+            if any(self.cfg_mask[self.stepi]):
+                output = headwise_cfg_attention(query, key, value, self.cfg_mask[self.stepi], self.wt[self.stepi].to(query.device))
             else:
-                output = self.window_func(
-                    query, key, value, block_mask=self.timestep_block_mask[self.stepi][0]
-                ).transpose(1, 2)
+                output = flash_attn_ours.headwise_window_attn(
+                    query.transpose(1, 2), 
+                    key.transpose(1, 2), 
+                    value.transpose(1, 2), 
+                    window_sizes = self.wt[self.stepi].to(query.device)
+                )
         else:
-            output = self.window_func(
-                query, key, value, block_mask=self.timestep_block_mask[self.stepi]
-            ).transpose(1, 2)
+            output = flash_attn_ours.headwise_window_attn(
+                    query.transpose(1, 2), 
+                    key.transpose(1, 2), 
+                    value.transpose(1, 2), 
+                    window_sizes = self.wt[self.stepi].to(query.device)
+            )
             # self.window_func(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.timestep_block_mask[self.stepi]).transpose(1, 2)
-            torch.cuda.synchronize()
         if output[:,:,self.output_share_dict[self.stepi],:].shape != self.cached_output.shape:
             breakpoint()
         output[:,:,self.output_share_dict[self.stepi],:] = self.cached_output
@@ -268,7 +307,9 @@ class DiTFastAttnProcessor:
         return output
     
     def raw_qkv_process_after_calib_func(self, query, key, value, forward_args):
-        hidden_states = flash_attn.flash_attn_func(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2))
+        hidden_states = flash_attn_ours.flash_attn_func(query.transpose(1,2), 
+                                                   key.transpose(1,2), 
+                                                   value.transpose(1,2))
         if self.stepi+1 in self.output_share_dict.keys():
             self.cached_output = hidden_states[:,:,self.output_share_dict[self.stepi+1],:]
         return hidden_states
@@ -323,7 +364,7 @@ class DiTFastAttnProcessor:
         )
 
         if self.forward_mode == "calib_collect_info":
-            self.prev_calib_output = hidden_states.detach()
+            self.prev_calib_output = hidden_states
 
         hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)

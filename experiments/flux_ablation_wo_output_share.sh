@@ -1,0 +1,4 @@
+CUDA_VISIBLE_DEVICES=4 python flux_generation.py --threshold 0.05 --eval_n_images 5000 --n_calib 8 --save_path data/flux_1024_coco_5k_ablation_wo_output_share &
+CUDA_VISIBLE_DEVICES=5 python flux_generation.py --threshold 0.10 --eval_n_images 5000 --n_calib 8 --save_path data/flux_1024_coco_5k_ablation_wo_output_share &
+CUDA_VISIBLE_DEVICES=6 python flux_generation.py --threshold 0.15 --eval_n_images 5000 --n_calib 8 --save_path data/flux_1024_coco_5k_ablation_wo_output_share &
+CUDA_VISIBLE_DEVICES=7 python flux_generation.py --threshold 0.20 --eval_n_images 5000 --n_calib 8 --save_path data/flux_1024_coco_5k_ablation_wo_output_share &

@@ -1,0 +1,4 @@
+CUDA_VISIBLE_DEVICES=3 python sd3_generation.py --model_name sd3_wa_ast --method_set wa_ast --threshold 0.05 --eval_n_images 5000 --n_calib 8 --save_path data/sd3_wa_ast_1024_coco_5k &
+CUDA_VISIBLE_DEVICES=4 python sd3_generation.py --model_name sd3_wa_ast --method_set wa_ast --threshold 0.10 --eval_n_images 5000 --n_calib 8 --save_path data/sd3_wa_ast_1024_coco_5k &
+CUDA_VISIBLE_DEVICES=5 python sd3_generation.py --model_name sd3_wa_ast --method_set wa_ast --threshold 0.15 --eval_n_images 5000 --n_calib 8 --save_path data/sd3_wa_ast_1024_coco_5k &
+CUDA_VISIBLE_DEVICES=6 python sd3_generation.py --model_name sd3_wa_ast --method_set wa_ast --threshold 0.20 --eval_n_images 5000 --n_calib 8 --save_path data/sd3_wa_ast_1024_coco_5k &

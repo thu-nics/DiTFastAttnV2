@@ -1,0 +1,4 @@
+CUDA_VISIBLE_DEVICES=4 python flux_generation.py --resolution 1024 --save_path data/flux_2048_coco_5k --threshold 0.1 --eval_n_images 5000 --n_calib 8 &
+CUDA_VISIBLE_DEVICES=5 python flux_generation.py --resolution 1024 --save_path data/flux_2048_coco_5k --threshold 0.2 --eval_n_images 5000 --n_calib 8 &
+CUDA_VISIBLE_DEVICES=6 python flux_generation.py --resolution 1024 --save_path data/flux_2048_coco_5k --threshold 0.3 --eval_n_images 5000 --n_calib 8 &
+CUDA_VISIBLE_DEVICES=7 python flux_generation.py --resolution 1024 --save_path data/flux_2048_coco_5k --threshold 0.4 --eval_n_images 5000 --n_calib 8 &
