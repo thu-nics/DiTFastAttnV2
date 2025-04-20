@@ -1,8 +1,8 @@
 # DiTFastAttnV2: Head-wise Attention Compression for Multi-Modality Diffusion Transformers
 
 # TODO
-- [ ] Release Fused Kernel for DiTFastAttnV2
-- [ ] 
+- [ ] release scripts and kernels that support residual sharing
+- [ ] extend and support for video generation (CogVideoX, HunyuanVideo, Wan2.1, etc)
 
 # Install
 
@@ -19,8 +19,8 @@ pip install thop pytorch_fid torchmetrics accelerate torchmetrics[image] beautif
 
 # Usage
 
-Please see `demo.py` for a quick start.
+Please see `sd3_generation.py` and `flux_generation.py` for a quick start.
 ```
-python demo.py
+python sd3_generation.py
 ```
 
