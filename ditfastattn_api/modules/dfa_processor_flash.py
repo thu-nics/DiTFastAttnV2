@@ -3,7 +3,7 @@ from diffusers.models.attention_processor import Attention, AttnProcessor2_0, Jo
 from typing import List, Optional
 import torch.nn.functional as F
 # import flash_attn
-import flash_attn_ours
+import dfav2
 import copy
 from time import time
 from ditfastattn_api.modules.ilp import solve_ip
@@ -74,7 +74,7 @@ def headwise_cfg_attention(query, key, value, head_mask, window_sizes):
         key_first_half = key_replace[:half_B]
         value_first_half = value_replace[:half_B]
 
-        attention_first_half = flash_attn_ours.headwise_window_attn(query_first_half.transpose(1,2), 
+        attention_first_half = dfav2.headwise_window_attn(query_first_half.transpose(1,2), 
                                          key_first_half.transpose(1,2), 
                                          value_first_half.transpose(1,2), 
                                          window_sizes=window_sizes[head_mask,:])
@@ -86,7 +86,7 @@ def headwise_cfg_attention(query, key, value, head_mask, window_sizes):
 
     # 对于不需要替换的 head，正常计算所有 batch 的 attention
     if query_normal.size(2) > 0:  # 如果有不需要替换的 head
-        attention_normal = flash_attn_ours.headwise_window_attn(query_normal.transpose(1,2), 
+        attention_normal = dfav2.headwise_window_attn(query_normal.transpose(1,2), 
                                      key_normal.transpose(1,2), 
                                      value_normal.transpose(1,2),
                                      window_sizes=window_sizes[~head_mask,:])  # shape: (B, S, H_normal, D)
@@ -138,7 +138,7 @@ class DiTFastAttnProcessor:
         attn=forward_args["attn"]
         candidates = self.dfa_config.get_available_candidates(attn.name)
         B, H, S, _ = query.shape
-        full_hidden_states = flash_attn_ours.flash_attn_func(query.transpose(1,2), 
+        full_hidden_states = dfav2.flash_attn_func(query.transpose(1,2), 
                                                              key.transpose(1,2), 
                                                              value.transpose(1,2))
         for candidate in candidates:
@@ -156,7 +156,7 @@ class DiTFastAttnProcessor:
 
                 # use flash_attn_func window
                 window_size = S // (window_size_factor * 2)
-                hidden_states = flash_attn_ours.flash_attn_func(query.transpose(1,2), 
+                hidden_states = dfav2.flash_attn_func(query.transpose(1,2), 
                                                                 key.transpose(1,2), 
                                                                 value.transpose(1,2), 
                                                                 window_size=[window_size, window_size])
@@ -212,7 +212,7 @@ class DiTFastAttnProcessor:
             if wt.any() == 0:
                 output = None
             else:
-                output = flash_attn_ours.headwise_window_attn(
+                output = dfav2.headwise_window_attn(
                     query.transpose(1, 2), 
                     key.transpose(1, 2), 
                     value.transpose(1, 2), 
@@ -264,7 +264,7 @@ class DiTFastAttnProcessor:
                 if wt.any() == 0:
                     output = None
                 else:
-                    output = flash_attn_ours.headwise_window_attn(
+                    output = dfav2.headwise_window_attn(
                         query.transpose(1, 2), 
                         key.transpose(1, 2), 
                         value.transpose(1, 2), 
@@ -285,14 +285,14 @@ class DiTFastAttnProcessor:
             if any(self.cfg_mask[self.stepi]):
                 output = headwise_cfg_attention(query, key, value, self.cfg_mask[self.stepi], self.wt[self.stepi].to(query.device))
             else:
-                output = flash_attn_ours.headwise_window_attn(
+                output = dfav2.headwise_window_attn(
                     query.transpose(1, 2), 
                     key.transpose(1, 2), 
                     value.transpose(1, 2), 
                     window_sizes = self.wt[self.stepi].to(query.device)
                 )
         else:
-            output = flash_attn_ours.headwise_window_attn(
+            output = dfav2.headwise_window_attn(
                     query.transpose(1, 2), 
                     key.transpose(1, 2), 
                     value.transpose(1, 2), 
@@ -307,7 +307,7 @@ class DiTFastAttnProcessor:
         return output
     
     def raw_qkv_process_after_calib_func(self, query, key, value, forward_args):
-        hidden_states = flash_attn_ours.flash_attn_func(query.transpose(1,2), 
+        hidden_states = dfav2.flash_attn_func(query.transpose(1,2), 
                                                    key.transpose(1,2), 
                                                    value.transpose(1,2))
         if self.stepi+1 in self.output_share_dict.keys():

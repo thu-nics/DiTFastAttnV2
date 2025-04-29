@@ -6,16 +6,12 @@ from diffusers.models.transformers.transformer_flux import FluxTransformerBlock,
 from diffusers.models.transformers.cogvideox_transformer_3d import CogVideoXBlock
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from ditfastattn_api.modules.dfa_ffn import DiTFastAttnFFN, ForaFFN
-# from ditfastattn_api.modules.dfa_processor import DiTFastAttnProcessor, MMDiTFastAttnProcessor
-# --------
+
 from ditfastattn_api.modules.dfa_processor_flash import DiTFastAttnProcessor
 from ditfastattn_api.modules.dfa_processor_sd3_5_flash import MMDiTFastAttnProcessor
-# from ditfastattn_api.modules.dfa_processor_sd3_5_residual import MMDiTFastAttnProcessor
 from ditfastattn_api.modules.dfa_processor_flux_flash import FLUXFastAttnProcessor
-# from ditfastattn_api.modules.dfa_processor_flux import FLUXFastAttnProcessor
 from ditfastattn_api.modules.dfa_processor_cogvideox import CogVideoXFastAttnProcessor
-# from ditfastattn_api.modules.dfa_processor_sd3_5_wo_ilp import MMDiTFastAttnProcessor
-# --------
+
 from ditfastattn_api.dfa_config import DiTFastAttnConfig
 import time
 import numpy as np
@@ -372,13 +368,10 @@ class MethodSpeedup:
             for candidate in self.candidates:
                 print(candidate)
                 if candidate[1] == "output_share":
-                    print("It is output_share")
                     self.speedup_dict[candidate] = 1
                 elif candidate[1] == "cfg_share":
-                    print("It is cfg_share")
                     self.speedup_dict[candidate] = 0.5
                 elif "arrow_attn" in candidate[1]:
-                    print("It is window attn")
                     window_size = self.vtok_len // 8
                     full_computation = (self.vtok_len + self.ttok_len)**2
                     ratio = (full_computation -  (self.vtok_len - window_size // 2) **2) / full_computation 

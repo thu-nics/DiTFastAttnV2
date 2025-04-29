@@ -20,7 +20,7 @@ from ditfastattn_api.fisher_info_planning import update_layer_influence_two_phas
 from PIL import Image
 
 from diffusers.models.attention_processor import Attention
-from diffusers.models.transformers.transformer_flux import FluxTransformerBlock, FluxSingleTransformerBlock
+from diffusers.models.attention import JointTransformerBlock
 
 METHOD_CANDIDATES_DICT = {'add_cfg': ["output_share", 
                                      "cfg_share", 
@@ -81,7 +81,6 @@ def main():
         for i in calib_x:
             res.append(mscoco_anno["annotations"][i]["caption"])
         yield {"prompt": res,"num_inference_steps": n_steps, "generator": generator, "height": args.resolution, "width": args.resolution}
-
     candidates = METHOD_CANDIDATES_DICT[args.method_set]
     print(candidates)
     dfa_config = transform_model_dfa(pipe.transformer, n_steps=n_steps, candidates=candidates)
@@ -90,7 +89,6 @@ def main():
     latency_dict = ms.generate_headwise_latency('estimate', pipe, n_steps, dfa_config, caption_list, num_inference_steps=n_steps, height=resolution, width=resolution)
     print(latency_dict)
     torch.save(latency_dict, f"cache/{args.model_name}_{args.resolution}_latency_dict.json")
-
     dfa_config.latency = latency_dict
     
     register_refresh_stepi_hook(pipe.transformer, n_steps=n_steps)
@@ -118,7 +116,7 @@ def main():
 
         for name, module in pipe.transformer.named_modules():
             module.name = name
-            if isinstance(module,FluxTransformerBlock) or isinstance(module, FluxSingleTransformerBlock):
+            if isinstance(module, JointTransformerBlock):
                 # for MMDiT
                 if isinstance(module.attn, Attention):
                     module.attn.compression_influences = {}
@@ -129,6 +127,7 @@ def main():
                     module.attn.processor.prev_calib_output = None
                     module.attn.processor.wt = dfa_config.wt[module.attn.name]
                     module.attn.processor.output_share_dict = dfa_config.output_share_dict[module.attn.name]
+        breakpoint()
         
     else:
         print("-------start calibration--------")
@@ -164,21 +163,25 @@ def main():
         slice = mscoco_anno["annotations"][index : index + args.eval_batchsize]
         filename_list = [str(d["id"]).zfill(12) for d in slice]
         print(f"Processing {index}th image")
-        caption_list = [d["caption"] for d in slice]
-        output = pipe(
-            caption_list,
-            num_inference_steps=n_steps, 
-            height=resolution, 
-            width=resolution, 
-            generator=generator,
-            output_type="np"
-        )
-        fake_images = output.images
-        count = 0
-        for j, image in enumerate(fake_images):
-            image = F.to_pil_image((image * 255).astype(np.uint8))
-            image.save(f"{save_path}/{filename_list[count]}.jpg")
-            count += 1
+
+        if os.path.isfile(f"{save_path}/{filename_list[0]}.jpg"):
+            continue
+        else:
+            caption_list = [d["caption"] for d in slice]
+            output = pipe(
+                caption_list,
+                num_inference_steps=n_steps, 
+                height=resolution, 
+                width=resolution, 
+                generator=generator,
+                output_type="np"
+            )
+            fake_images = output.images
+            count = 0
+            for j, image in enumerate(fake_images):
+                image = F.to_pil_image((image * 255).astype(np.uint8))
+                image.save(f"{save_path}/{filename_list[count]}.jpg")
+                count += 1
     
 if __name__ == "__main__":
     main()

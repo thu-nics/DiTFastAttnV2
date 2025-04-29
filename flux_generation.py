@@ -20,13 +20,13 @@ import os
 
 from ditfastattn_api.fisher_info_planning import set_flux_compression_plan
 from diffusers.models.attention_processor import Attention
-from diffusers.models.attention import JointTransformerBlock
+from diffusers.models.transformers.transformer_flux import FluxTransformerBlock, FluxSingleTransformerBlock
 
 from PIL import Image
 import torch._dynamo as dynamo
 dynamo.config.cache_size_limit = 10000  # Increase the cache size limit
 
-METHOD_CANDIDATES_DICT = {'wa_ast': ["output_share", 
+METHOD_CANDIDATES_DICT = {'default': ["output_share", 
                                      "without_residual_window_attn_8", 
                                      "without_residual_window_attn_16",
                                      "without_residual_window_attn_32"],
@@ -41,11 +41,11 @@ def main():
     parser.add_argument("--eval_n_images", type=int, default=4)
     parser.add_argument("--eval_batchsize", type=int, default=1)
     parser.add_argument("--save_path", type=str, default="data/flux_1024_coco_5k")
-    parser.add_argument("--threshold", type=float, default=0.4)
+    parser.add_argument("--threshold", type=float, default=0.2)
     parser.add_argument("--n_calib", type=int, default=8)
     parser.add_argument("--resolution", type=int, default=1024)
     parser.add_argument("--model_name", type=str, default="flash_flux")
-    parser.add_argument("--method_set", type=str, default="wa_ast")
+    parser.add_argument("--method_set", type=str, default="default")
     parser.add_argument("--cached_kernel_config", type=str, default=None)
     parser.add_argument("--cached_output_share_dict", type=str, default=None)
     parser.add_argument("--seed", type=int, default=3)
@@ -123,7 +123,7 @@ def main():
 
         for name, module in pipe.transformer.named_modules():
             module.name = name
-            if isinstance(module, JointTransformerBlock):
+            if isinstance(module,FluxTransformerBlock) or isinstance(module, FluxSingleTransformerBlock):
                 # for MMDiT
                 if isinstance(module.attn, Attention):
                     module.attn.compression_influences = {}

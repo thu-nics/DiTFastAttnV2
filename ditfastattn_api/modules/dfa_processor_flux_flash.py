@@ -3,7 +3,7 @@ from diffusers.models.attention_processor import Attention, AttnProcessor2_0, Jo
 from tmp.full_window_attn_with_window_residual import full_mm_attn_with_window_residual
 from typing import List, Optional
 import torch.nn.functional as F
-import flash_attn_ours
+import dfav2
 import copy
 from time import time
 from ditfastattn_api.modules.ilp import solve_ip
@@ -230,7 +230,7 @@ class FLUXFastAttnProcessor:
                 # without residual share
                 window_size_factor = int(candidate.split("_")[-1])
                 window_size = (S - 512) // (window_size_factor * 2)
-                hidden_states = flash_attn_ours.headwise_arrow_attn_trans(
+                hidden_states = dfav2.headwise_arrow_attn_trans(
                     query, 
                     key, 
                     value, 
@@ -282,7 +282,7 @@ class FLUXFastAttnProcessor:
 
         self.wt[self.stepi] = wt
 
-        output = flash_attn_ours.headwise_arrow_attn_trans(
+        output = dfav2.headwise_arrow_attn_trans(
             query, 
             key, 
             value, 
@@ -296,7 +296,7 @@ class FLUXFastAttnProcessor:
 
     
     def raw_qkv_process_func(self, query, key, value, forward_args):
-        hidden_states = flash_attn_ours.flash_attn_func(query, key, value)
+        hidden_states = dfav2.flash_attn_func(query, key, value)
         return hidden_states
 
     # def raw_qkv_process_func(self, query, key, value, forward_args):
@@ -311,7 +311,7 @@ class FLUXFastAttnProcessor:
         #     query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.timestep_block_mask[self.stepi]
         # ).transpose(1, 2)
         # torch.cuda.synchronize()
-        output = flash_attn_ours.headwise_arrow_attn_trans(
+        output = dfav2.headwise_arrow_attn_trans(
             query,
             key,
             value,
@@ -331,7 +331,7 @@ class FLUXFastAttnProcessor:
         # hidden_states = F.scaled_dot_product_attention(
         #     query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), attn_mask=None, dropout_p=0.0, is_causal=False
         # ).transpose(1,2)
-        hidden_states = flash_attn_ours.flash_attn_func(query, key, value)
+        hidden_states = dfav2.flash_attn_func(query, key, value)
         if self.stepi+1 in self.output_share_dict.keys():
             self.cached_output = hidden_states[:,:,self.output_share_dict[self.stepi+1],:].detach()
         return hidden_states
