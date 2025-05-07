@@ -1,5 +1,12 @@
 # DiTFastAttnV2: Head-wise Attention Compression for Multi-Modality Diffusion Transformers
 
+<a href="https://arxiv.org/abs/2503.22796">
+  <img alt="arxiv" src="https://img.shields.io/badge/arXiv-%3C2406.02540%3E-%23a72f20.svg">
+</a>
+
+![intro](assets/dfav2_overview.png)
+
+
 # Install
 
 ```

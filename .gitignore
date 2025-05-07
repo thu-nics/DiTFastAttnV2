@@ -1,12 +1,10 @@
 *.pyc
 .env
-*.png
 *.pth
 in_refmodel/Vector/main
 *.onnx
 *.lprof
 *.jpg
-*.png
 *.pdf
 *.npy
 *.tar
@@ -18,7 +16,6 @@ in_refmodel/Vector/main
 cache
 .env.sh
 repositories
-*.png
 DeepFloyd
 
 __pycache__/
