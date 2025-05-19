@@ -6,6 +6,9 @@
 
 ![intro](assets/dfav2_overview.png)
 
+End-to-end Latency and Speedup of DiTFastAttnV2 on FLUX 2K Image Generation 
+
+![speedup](assets/output.png)
 
 # Install
 
@@ -40,4 +43,4 @@ python flux_generation.py
 
 # TODO
 - [ ] release scripts and kernels that support more patterns include arrow attention with residual sharing and half arrow attention
-- [ ] extend and support for video generation (CogVideoX, HunyuanVideo, Wan2.1, etc)
+- [ ] extend and support for video generation (CogVideoX, HunyuanVideo, OpenSora 2.0, etc)
