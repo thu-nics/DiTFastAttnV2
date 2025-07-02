@@ -161,8 +161,9 @@ ongoing/*
 
 /flex_kernel_generation
 flex_kernel_generation/*
-iop_test.py
 /webdemo
 webdemo/*
 /hyvideo
 hyvideo/*
+/paro
+paro/*

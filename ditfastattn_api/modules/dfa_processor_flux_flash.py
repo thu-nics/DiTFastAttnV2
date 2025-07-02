@@ -1,19 +1,11 @@
 import torch
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
-from tmp.full_window_attn_with_window_residual import full_mm_attn_with_window_residual
 from typing import List, Optional
 import torch.nn.functional as F
 import dfav2
 import copy
 from time import time
 from ditfastattn_api.modules.ilp import solve_ip
-
-# from natten.functional import na1d, na2d
-import torch.nn as nn
-
-from torch.nn.attention.flex_attention import _mask_mod_signature, or_masks
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-from functools import partial
 
 class FLUXFastAttnProcessor:
     def __init__(self, steps_method=None, window_func=None, alpha=0):
@@ -105,10 +97,6 @@ class FLUXFastAttnProcessor:
         return attention_probs
     
     def run_forward(self, attn:Attention, hidden_states, encoder_hidden_states, qkv_process_func, image_rotary_emb):
-        # breakpoint()
-        # shortbreak - layer output caching
-
-        
         forward_args = dict(attn=attn, hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states)
         
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -209,14 +197,11 @@ class FLUXFastAttnProcessor:
             return hidden_states, encoder_hidden_states
         else:
             return hidden_states
-    
-    def calib_collect_info_qkv_process_func(self, query, key, value, forward_args):
-        # witout residual share window attention
-        pass
+
     
     def calib_qkv_process_func(self, query, key, value, forward_args):
         # window_size_candidates = [0.995,0.99,0.98,0.97,0.96,0.95]
-        headwise_relative_MSE={} # key (head, method) value: relative MSE = 均方误差（MSE）与目标变量方差的比值 （maybe）
+        headwise_relative_MSE={}
         # latency_delta={}
         attn=forward_args["attn"]
         candidates = self.dfa_config.get_available_candidates(attn.name)
@@ -252,19 +237,18 @@ class FLUXFastAttnProcessor:
                 if rse[h].item() < self.alpha / H * 1.5:
                     headwise_relative_MSE[(h, candidate)] = rse[h].item()
             
-        # ILP: target is to minimize the latency given MSE is below a threshold (?)
+        # ILP: target is to minimize the latency given MSE is below a threshold
         # breakpoint()
         if self.stepi not in self.dfa_config.plan.keys():
             self.dfa_config.plan[self.stepi] = {}
         if bool(headwise_relative_MSE):
-            # ILP: target is to minimize the latency given MSE is below a threshold (?)
+            # ILP: target is to minimize the latency given MSE is below a threshold
             head_method_list = solve_ip(headwise_relative_MSE,self.dfa_config.latency, self.alpha)
             print(head_method_list)
         else:
             head_method_list = {}
         self.dfa_config.plan[self.stepi][attn.name] = head_method_list
 
-        # breakpoint()
         # per head, gen kernel
         wt = -torch.ones(24, dtype=torch.int32, device=query.device)
         # wt = torch.ones(24, dtype=torch.int64) * ((S - 512) * 2)
@@ -278,7 +262,6 @@ class FLUXFastAttnProcessor:
             else:
                 wt[head] = (S - 512) // (int(ws)*2)
         wt = wt.repeat_interleave(2, dim=0).view(-1, 2)
-        # breakpoint()
 
         self.wt[self.stepi] = wt
 
@@ -298,19 +281,9 @@ class FLUXFastAttnProcessor:
     def raw_qkv_process_func(self, query, key, value, forward_args):
         hidden_states = dfav2.flash_attn_func(query, key, value)
         return hidden_states
-
-    # def raw_qkv_process_func(self, query, key, value, forward_args):
-    #     hidden_states = F.scaled_dot_product_attention(
-    #         query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), attn_mask=None, dropout_p=0.0, is_causal=False
-    #     ).transpose(1,2)
-    #     return hidden_states
     
     def qkv_process_perhead_func(self, query, key, value, forward_args):
         _, S, _, _ = query.shape
-        # output = self.window_func(
-        #     query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=self.timestep_block_mask[self.stepi]
-        # ).transpose(1, 2)
-        # torch.cuda.synchronize()
         output = dfav2.headwise_arrow_attn_trans(
             query,
             key,

@@ -1,6 +1,5 @@
 import torch
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
-from tmp.full_window_attn_with_window_residual import full_mm_attn_with_window_residual
 from typing import List, Optional
 import torch.nn.functional as F
 import flash_attn
