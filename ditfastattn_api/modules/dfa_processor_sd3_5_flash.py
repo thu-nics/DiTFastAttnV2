@@ -1,16 +1,8 @@
 import torch
-from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
-from typing import List, Optional
-import torch.nn.functional as F
+from diffusers.models.attention_processor import Attention
+from typing import Optional
 import dfav2
-import copy
-from time import time
 from ditfastattn_api.modules.ilp import solve_ip
-import torch.nn as nn
-
-from torch.nn.attention.flex_attention import _mask_mod_signature, or_masks
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-from functools import partial
 
 def headwise_cfg_attention(query, key, value, head_mask, window_sizes):
     """
@@ -73,11 +65,10 @@ def headwise_cfg_attention(query, key, value, head_mask, window_sizes):
 
 
 class MMDiTFastAttnProcessor:
-    def __init__(self, steps_method=None, cond_first=None, window_func=None, alpha=0):
+    def __init__(self, steps_method=None, alpha=0, window_func=None):
+        self.window_func = window_func
         self.steps_method = steps_method
-        self.cond_first = cond_first
         self.forward_mode = "normal" # could be "normal" or "perhead_normal" or "calib_get_info"
-        self.block_mask = {}
         self.prev_calib_output = None
         self.cached_output = None
         self.dfa_config=None

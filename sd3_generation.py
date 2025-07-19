@@ -107,9 +107,6 @@ def main():
         for attn_name in compression_config.keys():
             for step in compression_config[attn_name].keys():
                 compression_config[attn_name][step] = compression_config[attn_name][step].to('cuda')
-        # for attn_name in output_share_dict.keys():
-        #     for step in output_share_dict[attn_name].keys():
-        #         output_share_dict[attn_name][step] = output_share_dict[attn_name][step].to('cuda')
         
         dfa_config.wt = compression_config
         dfa_config.output_share_dict = output_share_dict
@@ -127,7 +124,6 @@ def main():
                     module.attn.processor.prev_calib_output = None
                     module.attn.processor.wt = dfa_config.wt[module.attn.name]
                     module.attn.processor.output_share_dict = dfa_config.output_share_dict[module.attn.name]
-        breakpoint()
         
     else:
         print("-------start calibration--------")

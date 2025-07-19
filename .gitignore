@@ -145,6 +145,7 @@ model/*
 sd3_generation_flex.py
 sd3_generation_fora.py
 sd3_generation_residual.py
+wan_generation_flex.py
 sample_video.py
 /kernel_test
 kernel_test/*

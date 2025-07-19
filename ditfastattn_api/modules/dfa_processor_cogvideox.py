@@ -2,10 +2,10 @@ import torch
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
 from typing import List, Optional
 import torch.nn.functional as F
-import flash_attn
 import copy
 from time import time
 from ditfastattn_api.modules.ilp import solve_ip
+import dfav2
 
 # from natten.functional import na1d, na2d
 import torch.nn as nn
@@ -296,7 +296,7 @@ class CogVideoXFastAttnProcessor:
         attn=forward_args["attn"]
         candidates = self.dfa_config.get_available_candidates(attn.name)
         B, S, H, _ = query.shape
-        full_hidden_states = flash_attn.flash_attn_func(query, key, value)
+        full_hidden_states = dfav2.flash_attn_func(query, key, value)
         for candidate in candidates:
             if "window_attn" in candidate:
                 # without residual share
@@ -432,15 +432,15 @@ class CogVideoXFastAttnProcessor:
         self.attn_weight+=p.mean(0).detach()
         self.attn_weight_num_count+=1
         
-        hidden_states = flash_attn.flash_attn_func(query, key, value)
+        hidden_states = dfav2.flash_attn_func(query, key, value)
         return hidden_states
     
     def raw_qkv_process_func(self, query, key, value, forward_args):
-        hidden_states = flash_attn.flash_attn_func(query, key, value)
+        hidden_states = dfav2.flash_attn_func(query, key, value)
         return hidden_states
     
     def raw_residual_cache_qkv_process_func(self, query, key, value, forward_args):
-        hidden_states = flash_attn.flash_attn_func(query, key, value)
+        hidden_states = dfav2.flash_attn_func(query, key, value)
         attn=forward_args["attn"]
         _, S, _, _ = query.shape
         if self.block_mask is None:
@@ -536,7 +536,7 @@ class CogVideoXFastAttnProcessor:
         return output
     
     def raw_qkv_process_after_calib_func(self, query, key, value, forward_args):
-        hidden_states = flash_attn.flash_attn_func(query, key, value)
+        hidden_states = dfav2.flash_attn_func(query, key, value)
         if self.stepi+1 in self.output_share_dict.keys():
             self.cached_output = hidden_states[:,:,self.output_share_dict[self.stepi+1],:]
         return hidden_states

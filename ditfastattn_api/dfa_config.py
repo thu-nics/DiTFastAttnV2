@@ -15,6 +15,7 @@ class DiTFastAttnConfig:
         self.wt = {}
         self.ffn_plan = {}
         self.output_share_dict = {}
+        self.reorder_mask = {}
 
     def add_attn_processor(self, layer_name, attn_processor, candidates=DEFAULT_ATTN_CANDIDATES):
         kwargs = {

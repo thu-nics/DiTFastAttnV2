@@ -2,7 +2,7 @@ import torch
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
 from typing import List, Optional
 import torch.nn.functional as F
-import flash_attn
+import dfav2
 import copy
 from time import time
 from ditfastattn_api.modules.ilp import solve_ip
@@ -137,7 +137,7 @@ class DiTFastAttnProcessor:
         attn=forward_args["attn"]
         candidates = self.dfa_config.get_available_candidates(attn.name)
         B, H, S, _ = query.shape
-        full_hidden_states = flash_attn.flash_attn_func(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2))
+        full_hidden_states = dfav2.flash_attn_func(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2))
         for candidate in candidates:
             if "window_attn" in candidate:
                 # without residual share
@@ -268,7 +268,7 @@ class DiTFastAttnProcessor:
         return output
     
     def raw_qkv_process_after_calib_func(self, query, key, value, forward_args):
-        hidden_states = flash_attn.flash_attn_func(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2))
+        hidden_states = dfav2.flash_attn_func(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2))
         if self.stepi+1 in self.output_share_dict.keys():
             self.cached_output = hidden_states[:,:,self.output_share_dict[self.stepi+1],:]
         return hidden_states
@@ -495,11 +495,11 @@ class DiTFastAttnProcessor:
     #                 is_causal=False,
     #             ).transpose(1, 2)
     #         elif "raw" in method:
-    #             all_hidden_states = flash_attn.flash_attn_func(query, key, value)
+    #             all_hidden_states = dfav2.flash_attn_func(query, key, value)
     #             if self.raw_steps_residual_config[self.stepi][0] == True:
     #                 # Compute the full-window attention residual
     #                 window_size = self.raw_steps_residual_config[self.stepi][1]
-    #                 w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
+    #                 w_hidden_states = dfav2.flash_attn_func(query, key, value, window_size=window_size)
     #                 w_residual = all_hidden_states - w_hidden_states
     #                 if "cfg_attn_share" in method:
     #                     w_residual = torch.cat([w_residual, w_residual], dim=0)
@@ -508,7 +508,7 @@ class DiTFastAttnProcessor:
     #             elif self.cache_residual_forced:
     #                 # Compute the full-window attention residual
     #                 window_size = [64, 64]
-    #                 w_hidden_states = flash_attn.flash_attn_func(query, key, value, window_size=window_size)
+    #                 w_hidden_states = dfav2.flash_attn_func(query, key, value, window_size=window_size)
     #                 w_residual = all_hidden_states - w_hidden_states
     #                 if "cfg_attn_share" in method:
     #                     w_residual = torch.cat([w_residual, w_residual], dim=0)
@@ -517,7 +517,7 @@ class DiTFastAttnProcessor:
     #             hidden_states = all_hidden_states
     #         elif "residual_window_attn" in method:
     #             window_size = int(method.split("_")[-1])
-    #             w_hidden_states = flash_attn.flash_attn_func(
+    #             w_hidden_states = dfav2.flash_attn_func(
     #                 query, key, value, window_size=(window_size // 2, window_size // 2)
     #             )
 

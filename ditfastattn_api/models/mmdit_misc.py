@@ -3,10 +3,11 @@ import torch.nn as nn
 import inspect
 from typing import Any, Dict, List, Optional, Tuple, Union
 # from diffusers.pipelines.dit.pipeline_dit import DiTPipeline, randn_tensor
-from diffusers import StableDiffusion3Pipeline, FluxPipeline, CogVideoXPipeline, PixArtSigmaPipeline
+from diffusers import StableDiffusion3Pipeline, FluxPipeline, CogVideoXPipeline, PixArtSigmaPipeline, WanPipeline
 from diffusers.models.attention_processor import Attention
 from diffusers.models.attention import FeedForward, JointTransformerBlock, BasicTransformerBlock
 from diffusers.models.transformers.cogvideox_transformer_3d import CogVideoXBlock
+from diffusers.models.transformers.transformer_wan import WanTransformerBlock
 from diffusers.models.transformers.transformer_flux import FluxTransformerBlock, FluxSingleTransformerBlock
 from ditfastattn_api.modules.dfa_ffn import DiTFastAttnFFN
 import numpy as np
@@ -50,6 +51,7 @@ basic_block_class = BasicTransformerBlock
 flux_block_class = FluxTransformerBlock
 flux_single_block_class = FluxSingleTransformerBlock
 cogvideox_block_class = CogVideoXBlock
+wan_block_class = WanTransformerBlock
 attn_class = Attention
 ffn_class = FeedForward
 
@@ -1101,8 +1103,8 @@ def inference_fn_plan_update_iop_per_head_flux(
                 module.attn.processor.prev_calib_output = None
                 module.attn.processor.cached_output = None
                 module.attn.processor.output_share_dict = {}
-                dfa_config.wt[module.attn.name] = module.attn.processor.wt
-                dfa_config.output_share_dict[module.attn.name] = module.attn.processor.output_share_dict
+                # dfa_config.wt[module.attn.name] = module.attn.processor.wt
+                # dfa_config.output_share_dict[module.attn.name] = module.attn.processor.output_share_dict
             if hasattr(module, "ff"):
                 if isinstance(module.ff, DiTFastAttnFFN):
                     module.ff.compression_influences = {}
@@ -1186,6 +1188,8 @@ def inference_fn_plan_update_iop_per_head_flux(
                 module.attn.processor.dfa_config=None
                 module.attn.processor.forward_mode = "perhead_normal"
                 module.attn.processor.prev_calib_output = None
+                dfa_config.wt[module.attn.name] = module.attn.processor.wt
+                dfa_config.output_share_dict[module.attn.name] = module.attn.processor.output_share_dict
             if hasattr(module, "ff"):
                 if isinstance(module.ff, DiTFastAttnFFN):
                     module.ff.compression_influences = {}
@@ -1535,6 +1539,21 @@ def inference_fn_plan_update_iop_per_head_pixart(
     # 6.1 Prepare micro-conditions.
     added_cond_kwargs = {"resolution": None, "aspect_ratio": None}
 
+    for name, module in pipe.transformer.named_modules():
+        module.name = name
+        if isinstance(module, wan_block_class):
+            # for MMDiT
+            if isinstance(module.attn1, attn_class):
+                module.attn1.processor.compression_influences = {}
+            #     module.attn.processor.dfa_config = dfa_config
+                module.attn1.processor.forward_mode = "calib_collect_info"
+                module.attn1.processor.dfa_config = dfa_config
+                module.attn1.processor.alpha = alpha
+                module.attn1.processor.timestep_block_mask = {}
+                module.attn1.processor.prev_calib_output = None
+                module.attn1.processor.cached_output = None
+                module.attn1.processor.output_share_dict = {}
+
     # 7. Denoising loop
     num_warmup_steps = max(len(timesteps) - num_inference_steps * pipe.scheduler.order, 0)
 
@@ -1652,4 +1671,158 @@ def inference_fn_plan_update_iop_per_head_pixart(
                     module.ff_context.compression_influences = {}
                     module.ff_context.mode = "normal"
                     module.ff_context.cache_output = None
+    torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def inference_fn_plan_update_iop_per_head_wan(
+    pipe: WanPipeline,
+    dfa_config,
+    alpha,
+    prompt: Union[str, List[str]] = None,
+    negative_prompt: Union[str, List[str]] = None,
+    height: int = 480,
+    width: int = 832,
+    num_frames: int = 81,
+    num_inference_steps: int = 50,
+    guidance_scale: float = 5.0,
+    num_videos_per_prompt: Optional[int] = 1,
+    generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    latents: Optional[torch.Tensor] = None,
+    prompt_embeds: Optional[torch.Tensor] = None,
+    negative_prompt_embeds: Optional[torch.Tensor] = None,
+    attention_kwargs: Optional[Dict[str, Any]] = None,
+    max_sequence_length: int = 512,
+):
+    if num_frames % pipe.vae_scale_factor_temporal != 1:
+        num_frames = num_frames // pipe.vae_scale_factor_temporal * pipe.vae_scale_factor_temporal + 1
+    num_frames = max(num_frames, 1)
+
+    pipe._guidance_scale = guidance_scale
+    pipe._attention_kwargs = attention_kwargs
+    pipe._current_timestep = None
+    pipe._interrupt = False
+
+    device = pipe._execution_device
+
+    # 2. Define call parameters
+    if prompt is not None and isinstance(prompt, str):
+        batch_size = 1
+    elif prompt is not None and isinstance(prompt, list):
+        batch_size = len(prompt)
+    else:
+        batch_size = prompt_embeds.shape[0]
+
+    # 3. Encode input prompt
+    prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        do_classifier_free_guidance=pipe.do_classifier_free_guidance,
+        num_videos_per_prompt=num_videos_per_prompt,
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        max_sequence_length=max_sequence_length,
+        device=device,
+    )
+
+    transformer_dtype = pipe.transformer.dtype
+    prompt_embeds = prompt_embeds.to(transformer_dtype)
+    if negative_prompt_embeds is not None:
+        negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
+
+    # 4. Prepare timesteps
+    pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps = pipe.scheduler.timesteps
+
+    # 5. Prepare latent variables
+    num_channels_latents = pipe.transformer.config.in_channels
+    latents = pipe.prepare_latents(
+        batch_size * num_videos_per_prompt,
+        num_channels_latents,
+        height,
+        width,
+        num_frames,
+        torch.float32,
+        device,
+        generator,
+        latents,
+    )
+
+    for name, module in pipe.transformer.named_modules():
+        module.name = name
+        if isinstance(module, wan_block_class):
+            # for MMDiT
+            if isinstance(module.attn1, attn_class):
+                module.attn1.processor.compression_influences = {}
+                module.attn1.processor.forward_mode = "calib_collect_info"
+                module.attn1.processor.dfa_config = dfa_config
+                module.attn1.processor.alpha = alpha
+                module.attn1.processor.timestep_block_mask = {}
+                module.attn1.processor.prev_calib_output = None
+                module.attn1.processor.cached_output = None
+                module.attn1.processor.output_share_dict = {}
+                # dfa_config.wt[module.attn1.name] = module.attn1.processor.wt
+                # dfa_config.output_share_dict[module.attn1.name] = module.attn1.processor.output_share_dict
+
+    # 6. Denoising loop
+    num_warmup_steps = len(timesteps) - num_inference_steps * pipe.scheduler.order
+    pipe._num_timesteps = len(timesteps)
+
+    with pipe.progress_bar(total=num_inference_steps) as progress_bar:
+        for i, t in enumerate(timesteps):
+            if pipe.interrupt:
+                continue
+
+            pipe._current_timestep = t
+            latent_model_input = latents.to(transformer_dtype)
+            timestep = t.expand(latents.shape[0])
+
+            for name, module in pipe.transformer.named_modules():
+                module.timestep_index = i
+                if hasattr(module, "stepi"):
+                    module.stepi = i
+                if isinstance(module, attn_class):
+                    module.processor.stepi = i
+
+            noise_pred = pipe.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
+
+            if pipe.do_classifier_free_guidance:
+                noise_uncond = pipe.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
+                noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            # call the callback, if provided
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % pipe.scheduler.order == 0):
+                progress_bar.update()
+
+    pipe._current_timestep = None
+
+    for name, module in pipe.transformer.named_modules():
+        module.name = name
+        if isinstance(module, wan_block_class):
+            # for MMDiT
+            if isinstance(module.attn1, attn_class):
+                module.attn1.compression_influences = {}
+                module.attn1.processor.cached_output = None
+                module.attn1.processor.cached_residual = None
+            #     module.attn.processor.cache_residual_forced = False
+                module.attn1.processor.dfa_config=None
+                module.attn1.processor.forward_mode = "perhead_normal"
+                module.attn1.processor.prev_calib_output = None
+                dfa_config.wt[module.attn1.name] = module.attn1.processor.wt
+                dfa_config.output_share_dict[module.attn1.name] = module.attn1.processor.output_share_dict
     torch.cuda.empty_cache()

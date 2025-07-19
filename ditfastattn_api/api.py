@@ -4,13 +4,18 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward, BasicTransformerBlock, JointTransformerBlock
 from diffusers.models.transformers.transformer_flux import FluxTransformerBlock, FluxSingleTransformerBlock
 from diffusers.models.transformers.cogvideox_transformer_3d import CogVideoXBlock
-from diffusers.models.attention_processor import Attention, AttnProcessor2_0
+from diffusers.models.transformers.transformer_wan import WanTransformerBlock
+from diffusers.models.attention_processor import Attention
 from ditfastattn_api.modules.dfa_ffn import DiTFastAttnFFN, ForaFFN
 
 from ditfastattn_api.modules.dfa_processor_flash import DiTFastAttnProcessor
 from ditfastattn_api.modules.dfa_processor_sd3_5_flash import MMDiTFastAttnProcessor
 from ditfastattn_api.modules.dfa_processor_flux_flash import FLUXFastAttnProcessor
-from ditfastattn_api.modules.dfa_processor_cogvideox import CogVideoXFastAttnProcessor
+# from ditfastattn_api.modules.dfa_processor_cogvideox_flash import CogVideoXFastAttnProcessor
+from ditfastattn_api.modules.dfa_processor_cogvideox_flash import CogVideoXFastAttnProcessor
+from ditfastattn_api.modules.dfa_processor_cogvideox import CogVideoXFastAttnProcessor as CogVideoXFlexAttnProcessor
+from ditfastattn_api.modules.dfa_processor_wan_flash import WanFastAttnProcessor
+from ditfastattn_api.modules.dfa_processor_wan import WanFastAttnProcessor as WanFlexAttnProcessor
 
 from ditfastattn_api.dfa_config import DiTFastAttnConfig
 import time
@@ -94,8 +99,100 @@ def transform_model_dfa(model, n_steps=20, window_func=None, candidates=None):
                 else:
                     dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor)
 
+        if isinstance(module, WanTransformerBlock):
+            if isinstance(module.attn1, Attention):
+                module.attn1.processor = WanFastAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+                if candidates is not None:
+                    dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor, candidates)
+                else:
+                    dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor)
+
     return dfa_config
 
+def transform_model_dfa_flex(model, n_steps=20, window_func=None, candidates=None):
+    """
+    transform the attention and ffn in a transformer model with DitFastAttnProcessor and DitFastAttnFFN.
+    Return the dfa config.
+    """
+    if not isinstance(model, nn.Module):
+        raise ValueError("model must be a nn.Module")
+    dfa_config = DiTFastAttnConfig()
+    for name, module in model.named_modules():
+        # if isinstance(module, BasicTransformerBlock):
+        #     # for DiT
+        #     if isinstance(module.attn1, Attention):
+        #         module.attn1.processor = DiTFastAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+        #         if candidates is not None:
+        #             dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor, candidates)
+        #         else:
+        #             dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor)
+        #     # if isinstance(module.ff, FeedForward):
+        #     #     module.ff = DiTFastAttnFFN(module.ff, steps_method=["raw" for _ in range(n_steps)])
+        #     #     dfa_config.add_ffn_layer(name + ".ff", module.ff)
+        # if isinstance(module, JointTransformerBlock):
+        #     # for SD3
+        #     if isinstance(module.attn, Attention):
+        #         module.attn.processor = MMDiTFastAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+        #         if candidates is not None:
+        #             dfa_config.add_attn_processor(name + ".attn", module.attn.processor, candidates)
+        #         else:
+        #             dfa_config.add_attn_processor(name + ".attn", module.attn.processor)
+        #     # for SD 3.5 dual attention 
+        #     if hasattr(module, "attn2"):
+        #         if isinstance(module.attn2, Attention):
+        #             module.attn2.processor = MMDiTFastAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+        #             if candidates is not None:
+        #                 dfa_config.add_attn_processor(name + ".attn2", module.attn.processor, candidates)
+        #             else:
+        #                 dfa_config.add_attn_processor(name + ".attn2", module.attn.processor)
+            # if isinstance(module.ff, FeedForward) or isinstance(module.ff, DiTFastAttnFFN):
+            #     print("---------------transform ffn---------------")
+            #     module.ff = DiTFastAttnFFN(module.ff, steps_method=["raw" for _ in range(n_steps)])
+            #     dfa_config.add_ffn_layer(name + ".ff", module.ff)
+            # if isinstance(module.ff_context, FeedForward) or isinstance(module.ff_context, DiTFastAttnFFN):
+            #     module.ff_context = DiTFastAttnFFN(module.ff_context, steps_method=["raw" for _ in range(n_steps)])
+            #     dfa_config.add_ffn_layer(name + ".ff_context", module.ff_context)
+        # if isinstance(module, FluxTransformerBlock):
+        #     # for flux
+        #     if isinstance(module.attn, Attention):
+        #         module.attn.processor = FLUXFastAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+        #         if candidates is not None:
+        #             dfa_config.add_attn_processor(name + ".attn", module.attn.processor, candidates)
+        #         else:
+        #             dfa_config.add_attn_processor(name + ".attn", module.attn.processor)
+            # if isinstance(module.ff, FeedForward) or isinstance(module.ff, DiTFastAttnFFN):
+            #     module.ff = DiTFastAttnFFN(module.ff, steps_method=["raw" for _ in range(n_steps)])
+            #     dfa_config.add_ffn_layer(name + ".ff", module.ff)
+            # if isinstance(module.ff_context, FeedForward) or isinstance(module.ff_context, DiTFastAttnFFN):
+            #     module.ff_context = DiTFastAttnFFN(module.ff_context, steps_method=["raw" for _ in range(n_steps)])
+            #     dfa_config.add_ffn_layer(name + ".ff_context", module.ff_context)
+
+        # if isinstance(module, FluxSingleTransformerBlock):
+        #     # for flux
+        #     if isinstance(module.attn, Attention):
+        #         module.attn.processor = FLUXFastAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+        #         if candidates is not None:
+        #             dfa_config.add_attn_processor(name + ".attn", module.attn.processor, candidates)
+        #         else:
+        #             dfa_config.add_attn_processor(name + ".attn", module.attn.processor)
+        
+        if isinstance(module, CogVideoXBlock):
+            if isinstance(module.attn1, Attention):
+                module.attn1.processor = CogVideoXFlexAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+                if candidates is not None:
+                    dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor, candidates)
+                else:
+                    dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor)
+
+        if isinstance(module, WanTransformerBlock):
+            if isinstance(module.attn1, Attention):
+                module.attn1.processor = WanFlexAttnProcessor(steps_method=["raw" for _ in range(n_steps)], window_func=window_func)
+                if candidates is not None:
+                    dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor, candidates)
+                else:
+                    dfa_config.add_attn_processor(name + ".attn1", module.attn1.processor)
+
+    return dfa_config
 
 # transform model to compare with FORA
 def transform_model_dfa_fora(model, n_steps=20, window_func=None, candidates=None):
@@ -211,7 +308,7 @@ def transformer_input_hook(module, arg, kwargs, output):
     module.saved_input = (arg, kwargs)
 
 
-def dfa_test_latency(pipe, *args, warmup=1, repeat=3, only_transformer=True, only_attention=True, **kwargs):
+def dfa_test_latency(pipe, *args, warmup=1, repeat=1, only_transformer=True, only_attention=True, **kwargs):
     """
     return latency
     """

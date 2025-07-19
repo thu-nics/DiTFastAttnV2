@@ -2,7 +2,7 @@ import torch
 from diffusers.models.attention_processor import Attention, AttnProcessor2_0, JointAttnProcessor2_0
 from typing import List, Optional
 import torch.nn.functional as F
-import flash_attn
+import dfav2
 import copy
 from time import time
 from ditfastattn_api.modules.ilp import solve_ip

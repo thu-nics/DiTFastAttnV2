@@ -11,11 +11,15 @@ def form_head_method_name(head_num, method):
         window_size = "-1"
     elif "arrow_attn" or "window_attn" in method:
         if "cfg" in method:
-            method_abbr = "ascaars"
+            method_abbr = "ascaa"
             window_size = "-" + method.split("_")[-1]
         else:
-            method_abbr = "aars"
-            window_size = method.split("_")[-1]
+            if "reorder" in method:
+                method_abbr = "aar"
+                window_size = "re" + method.split("_")[-1]
+            else:
+                method_abbr = "aa"
+                window_size = method.split("_")[-1]
     return "_".join([method_abbr, window_size, str(head_num)])
 
 def set_constraint(model, head_set, head_method_dict, alpha):
