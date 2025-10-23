@@ -41,6 +41,14 @@ python sd3_generation.py
 python flux_generation.py
 ```
 
-# TODO
-- [ ] release scripts and kernels that support more patterns include arrow attention with residual sharing and half arrow attention
-- [ ] extend and support for video generation (CogVideoX, HunyuanVideo, OpenSora 2.0, etc)
+# Extenstion to Video Generation Model
+
+For Video Generation Model, We use triton kernel from SVG (https://github.com/svg-project/Sparse-VideoGen) for token reorder and add temperal sparsity as a pattern in DiTFastAttn pattern search framework. Now we support Wan and CogVideoX.
+
+```
+python wan_generation.py
+```
+
+```
+python cogvideox_generation.py
+```
